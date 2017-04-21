@@ -75,6 +75,8 @@ parser.add_argument('-curriculum', action="store_true",
 parser.add_argument('-extra_shuffle', action="store_true",
                     help="""By default only shuffle mini-batch order; when true,
                     shuffle and re-assign mini-batches""")
+parser.add_argument('-k', type=int, default=5000,
+                    help='sigmoid increase rate for kl rate. r = 1 / (1 + k * exp(-i/k))')
 
 #learning rate
 parser.add_argument('-learning_rate', type=float, default=1.0,
@@ -126,7 +128,6 @@ def NMTCriterion(vocabSize):
         crit.cuda()
     return crit
 
-
 def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
     # compute generations one piece at a time
     num_correct, loss = 0, 0
@@ -158,10 +159,10 @@ def eval(model, criterion, data):
     model.eval()
     for i in range(len(data)):
         batch = data[i][:-1] # exclude original indices
-        outputs = model(batch)
+        outputs, mu, logvar = model(batch)
         targets = batch[1][1:]  # exclude <s> from targets
         loss, _, num_correct = memoryEfficientLoss(
-                outputs, targets, model.generator, criterion, eval=True)
+                outputs, targets, mu, logvar, model.generator, criterion, eval=True)
         total_loss += loss
         total_num_correct += num_correct
         total_words += targets.data.ne(onmt.Constants.PAD).sum()
@@ -195,12 +196,19 @@ def trainModel(model, trainData, validData, dataset, optim):
             batch = trainData[batchIdx][:-1] # exclude original indices
 
             model.zero_grad()
-            outputs = model(batch)
+            outputs, mu, logvar = model(batch)
             targets = batch[1][1:]  # exclude <s> from targets
             loss, gradOutput, num_correct = memoryEfficientLoss(
                     outputs, targets, model.generator, criterion)
 
             outputs.backward(gradOutput)
+
+            KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
+            KLD = torch.sum(KLD_element).mul_(-0.5)
+            total_step = epoch * len(trainData) + i
+            kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
+            KLD = kl_rate * KLD
+            KLD.backward()
 
             # update the parameters
             optim.step()
