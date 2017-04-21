@@ -85,10 +85,15 @@ class Decoder(nn.Module):
 
 class NMTModel(nn.Module):
 
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, opt):
         super(NMTModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
+        self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)
+        self.encoder_to_logvar = nn.Linear(concat_hidden_size., opt.latent_size)
+        self.latent_to_decoder = nn.Linear(self.config.latent_size, self.config.encoder_hidden_size)
+        self.elu = nn.ELU()
 
     def _fix_enc_hidden(self, h):
         #  the encoder hidden is  (layers*directions) x batch x dim
@@ -100,14 +105,37 @@ class NMTModel(nn.Module):
         else:
             return h
 
+    def encode(self, x):
+        enc_hidden, _ = self.encoder(x)
+        enc_hidden.transpose(0,1) # convert to batch major
+        enc_hidden = enc_hidden.view(enc_hidden.size()[0], -1)
+        mu = self.elu(self.encoder_to_mu(enc_hidden))
+        logvar = self.elu(self.encoder_to_logvar(encoder_state))
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = logvar.mul_(0.5).exp_()
+        if args.cuda:
+            eps = torch.cuda.FloatTensor(std.size()).normal_()
+        else:
+            eps = torch.FloatTensor(std.size()).normal_()
+        eps = Variable(eps)
+        return eps.mul(std).add_(mu)
+
+    def decode(self, z, tgt):
+        decoder_state = self.elu(self.latent_to_decoder(z))
+        # the decoder state is batch x (layers * rnn_size)
+        # we need to convert it to layers x batch x (directions * dim)
+        decoder_state.view(opt.layers, decoder_state.size()[0], -1)
+        x, dec_hidden = self.decoder(tgt, decoder_state)
+        return x
+
     def forward(self, input):
         src = input[0]
         tgt = input[1][:-1]  # exclude last target from inputs
-        enc_hidden, _ = self.encoder(src)
+        mu, logvar = self.encode(src)
+        z = self.reparameterize(mu, logvar)
+        out = self.decode(z, tgt)
 
-        enc_hidden = (self._fix_enc_hidden(enc_hidden[0]),
-                      self._fix_enc_hidden(enc_hidden[1]))
 
-        out, dec_hidden = self.decoder(tgt, enc_hidden)
-
-        return out
+        return out, mu, logvar
