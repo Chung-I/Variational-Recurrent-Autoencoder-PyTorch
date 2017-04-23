@@ -34,6 +34,8 @@ parser.add_argument('-rnn_size', type=int, default=500,
                     help='Size of LSTM hidden states')
 parser.add_argument('-word_vec_size', type=int, default=500,
                     help='Word embedding sizes')
+parser.add_argument('-latent_size', type=int, default=16,
+                    help='Latent space sizes')
 parser.add_argument('-input_feed', type=int, default=1,
                     help="""Feed the context vector at each time step as
                     additional input (via concatenation with the word
@@ -302,7 +304,7 @@ def main():
         nn.Linear(opt.rnn_size, dicts['tgt'].size()),
         nn.LogSoftmax())
 
-    model = onmt.Models.NMTModel(encoder, decoder)
+    model = onmt.Models.NMTModel(encoder, decoder, opt)
 
     if opt.train_from:
         print('Loading model from checkpoint at %s' % opt.train_from)

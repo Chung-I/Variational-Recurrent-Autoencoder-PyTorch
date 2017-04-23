@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import onmt.modules
+import pdb
 from torch.nn.utils.rnn import pad_packed_sequence as unpack
 from torch.nn.utils.rnn import pack_padded_sequence as pack
 
@@ -66,6 +67,7 @@ class Decoder(nn.Module):
             self.word_lut.weight.data.copy_(pretrained)
 
     def forward(self, input, hidden):
+        pdb.set_trace()
         emb = self.word_lut(input)
 
         # n.b. you can increase performance if you compute W_ih * x for all
@@ -89,10 +91,11 @@ class NMTModel(nn.Module):
         super(NMTModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.opt = opt
         concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
         self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)
-        self.encoder_to_logvar = nn.Linear(concat_hidden_size., opt.latent_size)
-        self.latent_to_decoder = nn.Linear(self.config.latent_size, self.config.encoder_hidden_size)
+        self.encoder_to_logvar = nn.Linear(concat_hidden_size, opt.latent_size)
+        self.latent_to_decoder = nn.Linear(opt.latent_size, concat_hidden_size)
         self.elu = nn.ELU()
 
     def _fix_enc_hidden(self, h):
@@ -107,15 +110,16 @@ class NMTModel(nn.Module):
 
     def encode(self, x):
         enc_hidden, _ = self.encoder(x)
-        enc_hidden.transpose(0,1) # convert to batch major
+        enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), -1)
+        enc_hidden = enc_hidden.transpose(0,1).contiguous() # convert to batch major
         enc_hidden = enc_hidden.view(enc_hidden.size()[0], -1)
         mu = self.elu(self.encoder_to_mu(enc_hidden))
-        logvar = self.elu(self.encoder_to_logvar(encoder_state))
+        logvar = self.elu(self.encoder_to_logvar(enc_hidden))
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
         std = logvar.mul_(0.5).exp_()
-        if args.cuda:
+        if self.opt.gpus:
             eps = torch.cuda.FloatTensor(std.size()).normal_()
         else:
             eps = torch.FloatTensor(std.size()).normal_()
@@ -126,7 +130,8 @@ class NMTModel(nn.Module):
         decoder_state = self.elu(self.latent_to_decoder(z))
         # the decoder state is batch x (layers * rnn_size)
         # we need to convert it to layers x batch x (directions * dim)
-        decoder_state.view(opt.layers, decoder_state.size()[0], -1)
+        decoder_state.view(self.opt.layers, decoder_state.size()[0], -1)
+        decoder_state = torch.chunk(decoder_state, 2, -1)
         x, dec_hidden = self.decoder(tgt, decoder_state)
         return x
 
