@@ -206,22 +206,22 @@ def trainModel(model, trainData, validData, dataset, optim):
             loss, gradOutput, num_correct = memoryEfficientLoss(
                     outputs, targets, model.generator, criterion)
 
-            outputs.backward(gradOutput, retain_variables=False)
+            outputs.backward(gradOutput, retain_variables=True)
 
-            #KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-            #KLD = torch.sum(KLD_element).mul_(-0.5)
-            #total_step = epoch * len(trainData) + i
-            #kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
-            #KLD_obj = kl_rate * KLD
-            #KLD_obj.backward()
+            KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
+            KLD = torch.sum(KLD_element).mul_(-0.5)
+            total_step = epoch * len(trainData) + i
+            kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
+            KLD_obj = kl_rate * KLD
+            KLD_obj.backward()
 
             # update the parameters
             optim.step()
 
             num_words = targets.data.ne(onmt.Constants.PAD).sum()
             report_loss += loss
-            #report_KLD += KLD.data[0]
-            #report_KLD_obj += KLD_obj.data[0]
+            report_KLD += KLD.data[0]
+            report_KLD_obj += KLD_obj.data[0]
             report_num_correct += num_correct
             report_tgt_words += num_words
             report_src_words += sum(batch[0][1])
@@ -229,10 +229,13 @@ def trainModel(model, trainData, validData, dataset, optim):
             total_num_correct += num_correct
             total_words += num_words
             if i % opt.log_interval == -1 % opt.log_interval:
-                print("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; %3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed" %
+                print("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; KLD: %6.2f; KLD obj: %6.2f; kl rate: %2.6f; %3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed" %
                       (epoch, i+1, len(trainData),
                       report_num_correct / report_tgt_words * 100,
                       math.exp(report_loss / report_tgt_words),
+                      report_KLD,
+                      report_KLD_obj,
+                      kl_rate,
                       report_src_words/(time.time()-start),
                       report_tgt_words/(time.time()-start),
                       time.time()-start_time))

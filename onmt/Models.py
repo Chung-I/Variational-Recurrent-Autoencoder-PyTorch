@@ -195,7 +195,7 @@ class NMTModel(nn.Module):
         if self.training and self.feed_gt_prob < 1:
             tgt = self.replace_by_unk(tgt, self.feed_gt_prob)
         mu, logvar = self.encode(src)
-        #z = self.reparameterize(mu, logvar)
+        z = self.reparameterize(mu, logvar)
         out = self.decode(mu, tgt)
         #enc_hidden, _ = self.encoder(src)
         #enc_hidden, _ = self.encoder(x)
