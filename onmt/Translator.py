@@ -228,3 +228,14 @@ class Translator(object):
             )
 
         return predBatch, predScore, goldScore
+
+    def interpolate(self, srcBatch):
+        tgtBatch = srcBatch
+        dataset = self.buildData(srcBatch, [None for _ in srcBatch])
+        src, _, indices = dataset[0]
+        mu, logvar = self.model.encode(src)
+        start, end = mu[0].data, mu[1].data
+        points = Variable(torch.cat([torch.lerp(start, end , w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 1))
+        decOut = self.model.decode(
+            points, tgtBatch[:-1])
+        
