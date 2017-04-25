@@ -178,8 +178,8 @@ class NMTModel(nn.Module):
         src = input[0]
         tgt = input[1][:-1]  # exclude last target from inputs
         mu, logvar = self.encode(src)
-        z = self.reparameterize(mu, logvar)
-        out = self.decode(z, tgt)
+        #z = self.reparameterize(mu, logvar)
+        out = self.decode(mu, tgt)
         #enc_hidden, _ = self.encoder(src)
         #enc_hidden, _ = self.encoder(x)
         #init_output = self.make_init_decoder_output(enc_hidden[0])
