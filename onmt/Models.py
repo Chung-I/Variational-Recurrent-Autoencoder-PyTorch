@@ -119,6 +119,7 @@ class NMTModel(nn.Module):
         self.decoder = decoder
         self.layers = opt.layers
         self.gpus = opt.gpus
+        self.feed_gt_prob = opt.feed_gt_prob
         concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
         self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)
         self.encoder_to_logvar = nn.Linear(concat_hidden_size, opt.latent_size)
@@ -174,9 +175,25 @@ class NMTModel(nn.Module):
         else:
             return h
 
+    def replace_by_unk(self, seqs, prob=0.75):
+        seq_len = seqs.size(0)
+        batch_size = seqs.size(1)
+        if self.gpus:
+            probs = Variable(torch.cuda.FloatTensor(seq_len - 1, batch_size).fill_(prob))
+            ones = Variable(torch.cuda.FloatTensor(1, batch_size).fill_(1.0))
+        else:
+            probs = Variable(torch.FloatTensor(seq_len - 2, batch_size).fill_(prob))
+            ones = Variable(torch.FloatTensor(1, batch_size).fill_(1.0))
+        probs = torch.cat((ones, probs), 0)
+        samples = torch.bernoulli(probs)
+        added = (1 - samples) * onmt.Constants.UNK
+        return torch.mul(seqs, samples.long()) + added.long()
+
     def forward(self, input):
         src = input[0]
         tgt = input[1][:-1]  # exclude last target from inputs
+        if self.feed_gt_prob < 1:
+            tgt = self.replace_by_unk(tgt, self.feed_gt_prob)
         mu, logvar = self.encode(src)
         #z = self.reparameterize(mu, logvar)
         out = self.decode(mu, tgt)

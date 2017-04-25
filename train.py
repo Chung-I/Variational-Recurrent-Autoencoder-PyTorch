@@ -47,6 +47,8 @@ parser.add_argument('-brnn', action='store_true',
 parser.add_argument('-brnn_merge', default='concat',
                     help="""Merge action for the bidirectional hidden states:
                     [concat|sum]""")
+parser.add_argument('-feed_gt_prob', type=float, default=0.75,
+                    help="""Probability of feeding ground truth when training. See word dropout in \"Generating Sentences from a continuous space\".""")
 
 ## Optimization options
 
@@ -172,7 +174,6 @@ def eval(model, criterion, data):
     model.train()
     return total_loss / total_words, total_num_correct / total_words
 
-
 def trainModel(model, trainData, validData, dataset, optim):
     print(model)
     model.train()
@@ -181,6 +182,7 @@ def trainModel(model, trainData, validData, dataset, optim):
     criterion = NMTCriterion(dataset['dicts']['tgt'].size())
 
     start_time = time.time()
+
     def trainEpoch(epoch):
 
         if opt.extra_shuffle and epoch > opt.curriculum:

@@ -5,3 +5,4 @@ data
 *.pyc
 *pred
 nohup.out
+*.sh
