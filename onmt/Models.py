@@ -192,7 +192,7 @@ class NMTModel(nn.Module):
     def forward(self, input):
         src = input[0]
         tgt = input[1][:-1]  # exclude last target from inputs
-        if self.feed_gt_prob < 1:
+        if self.training and self.feed_gt_prob < 1:
             tgt = self.replace_by_unk(tgt, self.feed_gt_prob)
         mu, logvar = self.encode(src)
         #z = self.reparameterize(mu, logvar)
