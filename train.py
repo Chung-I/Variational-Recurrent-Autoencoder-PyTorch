@@ -8,6 +8,7 @@ from torch import cuda
 from torch.autograd import Variable
 import math
 import time
+import pdb
 
 parser = argparse.ArgumentParser(description='train.py')
 
@@ -56,14 +57,14 @@ parser.add_argument('-max_generator_batches', type=int, default=32,
                     help="""Maximum batches of words in a sequence to run
                     the generator on in parallel. Higher is faster, but uses
                     more memory.""")
-parser.add_argument('-epochs', type=int, default=13,
+parser.add_argument('-epochs', type=int, default=20,
                     help='Number of training epochs')
 parser.add_argument('-start_epoch', type=int, default=1,
                     help='The epoch from which to start')
 parser.add_argument('-param_init', type=float, default=0.1,
                     help="""Parameters are initialized over uniform distribution
                     with support (-param_init, param_init)""")
-parser.add_argument('-optim', default='sgd',
+parser.add_argument('-optim', default='adam',
                     help="Optimization method. [sgd|adagrad|adadelta|adam]")
 parser.add_argument('-max_grad_norm', type=float, default=5,
                     help="""If the norm of the gradient vector exceeds this,
@@ -77,15 +78,15 @@ parser.add_argument('-curriculum', action="store_true",
 parser.add_argument('-extra_shuffle', action="store_true",
                     help="""By default only shuffle mini-batch order; when true,
                     shuffle and re-assign mini-batches""")
-parser.add_argument('-k', type=int, default=5000,
+parser.add_argument('-k', type=int, default=50000,
                     help='sigmoid increase rate for kl rate. r = 1 / (1 + k * exp(-i/k))')
 
 #learning rate
-parser.add_argument('-learning_rate', type=float, default=1.0,
+parser.add_argument('-learning_rate', type=float, default=1e-4,
                     help="""Starting learning rate. If adagrad/adadelta/adam is
                     used, then this is the global learning rate. Recommended
                     settings: sgd = 1, adagrad = 0.1, adadelta = 1, adam = 0.001""")
-parser.add_argument('-learning_rate_decay', type=float, default=0.5,
+parser.add_argument('-learning_rate_decay', type=float, default=1,
                     help="""If update_learning_rate, decay learning rate by
                     this much if (i) perplexity does not decrease on the
                     validation set or (ii) epoch has gone past
@@ -164,7 +165,7 @@ def eval(model, criterion, data):
         outputs, mu, logvar = model(batch)
         targets = batch[1][1:]  # exclude <s> from targets
         loss, _, num_correct = memoryEfficientLoss(
-                outputs, targets, mu, logvar, model.generator, criterion, eval=True)
+                outputs, targets, model.generator, criterion, eval=True)
         total_loss += loss
         total_num_correct += num_correct
         total_words += targets.data.ne(onmt.Constants.PAD).sum()
@@ -191,6 +192,7 @@ def trainModel(model, trainData, validData, dataset, optim):
 
         total_loss, total_words, total_num_correct = 0, 0, 0
         report_loss, report_tgt_words, report_src_words, report_num_correct = 0, 0, 0, 0
+        report_KLD, report_KLD_obj = 0, 0
         start = time.time()
         for i in range(len(trainData)):
 
@@ -203,20 +205,22 @@ def trainModel(model, trainData, validData, dataset, optim):
             loss, gradOutput, num_correct = memoryEfficientLoss(
                     outputs, targets, model.generator, criterion)
 
-            outputs.backward(gradOutput)
+            outputs.backward(gradOutput, retain_variables=True)
 
             KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
             KLD = torch.sum(KLD_element).mul_(-0.5)
             total_step = epoch * len(trainData) + i
             kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
-            KLD = kl_rate * KLD
-            KLD.backward()
+            KLD_obj = kl_rate * KLD
+            KLD_obj.backward()
 
             # update the parameters
             optim.step()
 
             num_words = targets.data.ne(onmt.Constants.PAD).sum()
             report_loss += loss
+            report_KLD += KLD.data[0]
+            report_KLD_obj += KLD_obj.data[0]
             report_num_correct += num_correct
             report_tgt_words += num_words
             report_src_words += sum(batch[0][1])
@@ -224,10 +228,13 @@ def trainModel(model, trainData, validData, dataset, optim):
             total_num_correct += num_correct
             total_words += num_words
             if i % opt.log_interval == -1 % opt.log_interval:
-                print("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; %3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed" %
+                print("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; kl loss: %6.2f; kl rate: %6.2f; kl obj: %6.2f; %3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed" %
                       (epoch, i+1, len(trainData),
                       report_num_correct / report_tgt_words * 100,
                       math.exp(report_loss / report_tgt_words),
+                      report_KLD,
+                      kl_rate,
+                      report_KLD_obj,
                       report_src_words/(time.time()-start),
                       report_tgt_words/(time.time()-start),
                       time.time()-start_time))
@@ -281,6 +288,7 @@ def main():
         print('Loading dicts from checkpoint at %s' % dict_checkpoint)
         checkpoint = torch.load(dict_checkpoint)
         dataset['dicts'] = checkpoint['dicts']
+
 
     trainData = onmt.Dataset(dataset['train']['src'],
                              dataset['train']['tgt'], opt.batch_size, opt.gpus)
@@ -346,12 +354,11 @@ def main():
             lr_decay=opt.learning_rate_decay,
             start_decay_at=opt.start_decay_at
         )
+        optim.set_parameters(model.parameters())
     else:
         print('Loading optimizer from checkpoint:')
         optim = checkpoint['optim']
         print(optim)
-
-    optim.set_parameters(model.parameters())
 
     if opt.train_from or opt.train_from_state_dict:
         optim.optimizer.load_state_dict(checkpoint['optim'].optimizer.state_dict())

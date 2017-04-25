@@ -3,3 +3,4 @@ multi-bleu.perl
 data
 *.pt
 *.pyc
+*pred

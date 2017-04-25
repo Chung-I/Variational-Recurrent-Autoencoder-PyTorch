@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import onmt.modules
-import pdb
 from torch.nn.utils.rnn import pad_packed_sequence as unpack
 from torch.nn.utils.rnn import pack_padded_sequence as pack
 
@@ -39,6 +38,35 @@ class Encoder(nn.Module):
             outputs = unpack(outputs)[0]
         return hidden_t, outputs
 
+
+class StackedLSTM(nn.Module):
+    def __init__(self, num_layers, input_size, rnn_size, dropout):
+        super(StackedLSTM, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+
+        for i in range(num_layers):
+            self.layers.append(nn.LSTMCell(input_size, rnn_size))
+            input_size = rnn_size
+
+    def forward(self, input, hidden):
+        h_0, c_0 = hidden
+        h_1, c_1 = [], []
+        for i, layer in enumerate(self.layers):
+            h_1_i, c_1_i = layer(input, (h_0[i], c_0[i]))
+            input = h_1_i
+            if i + 1 != self.num_layers:
+                input = self.dropout(input)
+            h_1 += [h_1_i]
+            c_1 += [c_1_i]
+
+        h_1 = torch.stack(h_1)
+        c_1 = torch.stack(c_1)
+
+        return input, (h_1, c_1)
+
+
 class Decoder(nn.Module):
 
     def __init__(self, opt, dicts):
@@ -52,11 +80,7 @@ class Decoder(nn.Module):
         self.word_lut = nn.Embedding(dicts.size(),
                                   opt.word_vec_size,
                                   padding_idx=onmt.Constants.PAD)
-        self.rnn = nn.LSTM(input_size, opt.rnn_size,
-                num_layers=opt.layers,
-                dropout=opt.dropout)
-        
-        self.attn = onmt.modules.GlobalAttention(opt.rnn_size)
+        self.rnn = StackedLSTM(opt.layers, input_size, opt.rnn_size, opt.dropout)  
         self.dropout = nn.Dropout(opt.dropout)
 
         self.hidden_size = opt.rnn_size
@@ -66,16 +90,18 @@ class Decoder(nn.Module):
             pretrained = torch.load(opt.pre_word_vecs_dec)
             self.word_lut.weight.data.copy_(pretrained)
 
-    def forward(self, input, hidden):
-        pdb.set_trace()
+    def forward(self, input, hidden, init_output):
         emb = self.word_lut(input)
 
         # n.b. you can increase performance if you compute W_ih * x for all
         # iterations in parallel, but that's only possible if
         # self.input_feed=False
         outputs = []
+        output = init_output
         for emb_t in emb.split(1):
             emb_t = emb_t.squeeze(0)
+            if self.input_feed:
+                emb_t = torch.cat((emb_t, output), 1)
 
             output, hidden = self.rnn(emb_t, hidden)
             output = self.dropout(output)
@@ -91,13 +117,53 @@ class NMTModel(nn.Module):
         super(NMTModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.opt = opt
+        self.layers = opt.layers
+        self.gpus = opt.gpus
         concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
         self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)
         self.encoder_to_logvar = nn.Linear(concat_hidden_size, opt.latent_size)
         self.latent_to_decoder = nn.Linear(opt.latent_size, concat_hidden_size)
-        self.elu = nn.ELU()
+        self.prelu_mu = nn.PReLU()
+        self.prelu_logvar = nn.PReLU()
+        self.prelu_dec = nn.PReLU()
 
+    def encode(self, x):
+        enc_hidden, _ = self.encoder(x)
+        #  the encoder hidden is a tensor tuple with dimension (layers*directions) x batch x dim
+        #  we need to convert it to batch x (2*layers*directions*dim)
+        enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), 2)
+        enc_hidden = enc_hidden.transpose(0,1).contiguous() # convert to batch major
+        enc_hidden = enc_hidden.view(enc_hidden.size(0), -1)
+        mu = self.prelu_mu(self.encoder_to_mu(enc_hidden))
+        logvar = self.prelu_logvar(self.encoder_to_logvar(enc_hidden))
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(torch.mul(logvar, 0.5))
+        if self.gpus:
+            eps = torch.cuda.FloatTensor(std.size()).normal_()
+        else:
+            eps = torch.FloatTensor(std.size()).normal_()
+        eps = Variable(eps)
+        return torch.add(torch.mul(eps, std), mu)
+    
+    def make_init_decoder_output(self, z):
+        batch_size = z.size(0)
+        h_size = (batch_size, self.decoder.hidden_size)
+        return Variable(z.data.new(*h_size).zero_(), requires_grad=False)
+
+    def decode(self, z, tgt):
+        decoder_state = self.prelu_dec(self.latent_to_decoder(z))
+        # the decoder state is batch x (2*layers*directions*dim)
+        # we need to convert it to a tensor tuple with dimesion layers x batch x (directions * dim)
+        decoder_state = decoder_state.view(self.layers, decoder_state.size(0), -1)
+        decoder_state = torch.split(decoder_state, decoder_state.size(-1)//2, 2)
+
+        init_output = self.make_init_decoder_output(z)
+
+        x, dec_hidden = self.decoder(tgt, decoder_state, init_output)
+        return x
+    
     def _fix_enc_hidden(self, h):
         #  the encoder hidden is  (layers*directions) x batch x dim
         #  we need to convert it to layers x batch x (directions*dim)
@@ -108,39 +174,27 @@ class NMTModel(nn.Module):
         else:
             return h
 
-    def encode(self, x):
-        enc_hidden, _ = self.encoder(x)
-        enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), -1)
-        enc_hidden = enc_hidden.transpose(0,1).contiguous() # convert to batch major
-        enc_hidden = enc_hidden.view(enc_hidden.size()[0], -1)
-        mu = self.elu(self.encoder_to_mu(enc_hidden))
-        logvar = self.elu(self.encoder_to_logvar(enc_hidden))
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        std = logvar.mul_(0.5).exp_()
-        if self.opt.gpus:
-            eps = torch.cuda.FloatTensor(std.size()).normal_()
-        else:
-            eps = torch.FloatTensor(std.size()).normal_()
-        eps = Variable(eps)
-        return eps.mul(std).add_(mu)
-
-    def decode(self, z, tgt):
-        decoder_state = self.elu(self.latent_to_decoder(z))
-        # the decoder state is batch x (layers * rnn_size)
-        # we need to convert it to layers x batch x (directions * dim)
-        decoder_state.view(self.opt.layers, decoder_state.size()[0], -1)
-        decoder_state = torch.chunk(decoder_state, 2, -1)
-        x, dec_hidden = self.decoder(tgt, decoder_state)
-        return x
-
     def forward(self, input):
         src = input[0]
         tgt = input[1][:-1]  # exclude last target from inputs
         mu, logvar = self.encode(src)
         z = self.reparameterize(mu, logvar)
         out = self.decode(z, tgt)
+        #enc_hidden, _ = self.encoder(src)
+        #enc_hidden, _ = self.encoder(x)
+        #init_output = self.make_init_decoder_output(enc_hidden[0])
+        #enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), 2)
+        #enc_hidden = enc_hidden.transpose(0,1).contiguous() # convert to batch major
+        #enc_hidden = enc_hidden.view(enc_hidden.size(0), -1)
+        #mu = self.prelu_mu(self.encoder_to_mu(enc_hidden))
+        #decoder_state = self.prelu_dec(self.latent_to_decoder(mu))
+        #decoder_state = decoder_state.view(self.layers, decoder_state.size(0), -1)
+        #decoder_state = torch.chunk(decoder_state, 2, 2)
 
+        #decoder_state = (self._fix_enc_hidden(decoder_state[0]),
+        #                 self._fix_enc_hidden(decoder_state[1]))
+
+        #out, dec_hidden = self.decoder(tgt, decoder_state, init_output)
+        #out, dec_hidden = self.decoder(tgt, enc_hidden, init_output)
 
         return out, mu, logvar
