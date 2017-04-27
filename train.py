@@ -8,6 +8,7 @@ from torch import cuda
 from torch.autograd import Variable
 import math
 import time
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description='train.py')
 
@@ -132,6 +133,10 @@ def NMTCriterion(vocabSize):
         crit.cuda()
     return crit
 
+def KLDLoss(mu, logvar):
+    KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
+    return torch.sum(KLD_element).mul_(-0.5)
+
 def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
     # compute generations one piece at a time
     num_correct, loss = 0, 0
@@ -154,9 +159,9 @@ def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
     grad_output = None if outputs.grad is None else outputs.grad.data
     return loss, grad_output, num_correct
 
-
 def eval(model, criterion, data):
     total_loss = 0
+    total_KLD = 0
     total_words = 0
     total_num_correct = 0
 
@@ -167,12 +172,14 @@ def eval(model, criterion, data):
         targets = batch[1][1:]  # exclude <s> from targets
         loss, _, num_correct = memoryEfficientLoss(
                 outputs, targets, model.generator, criterion, eval=True)
+        KLD = KLDLoss(mu, logvar)
         total_loss += loss
+        total_KLD += KLD.data[0]
         total_num_correct += num_correct
         total_words += targets.data.ne(onmt.Constants.PAD).sum()
 
     model.train()
-    return total_loss / total_words, total_num_correct / total_words
+    return total_loss / total_words, total_KLD / total_words, total_num_correct / total_words
 
 def trainModel(model, trainData, validData, dataset, optim):
     print(model)
@@ -192,11 +199,13 @@ def trainModel(model, trainData, validData, dataset, optim):
         batchOrder = torch.randperm(len(trainData))
 
         total_loss, total_words, total_num_correct = 0, 0, 0
+        total_KLD, total_KLD_obj = 0, 0
         report_loss, report_tgt_words, report_src_words, report_num_correct = 0, 0, 0, 0
         report_KLD, report_KLD_obj = 0, 0
         start = time.time()
         for i in range(len(trainData)):
 
+            total_step = epoch * len(trainData) + i
             batchIdx = batchOrder[i] if epoch > opt.curriculum else i
             batch = trainData[batchIdx][:-1] # exclude original indices
 
@@ -208,9 +217,7 @@ def trainModel(model, trainData, validData, dataset, optim):
 
             outputs.backward(gradOutput, retain_variables=True)
 
-            KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-            KLD = torch.sum(KLD_element).mul_(-0.5)
-            total_step = epoch * len(trainData) + i
+            KLD = KLDLoss(mu, logvar)
             kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
             KLD_obj = kl_rate * KLD
             KLD_obj.backward()
@@ -226,6 +233,8 @@ def trainModel(model, trainData, validData, dataset, optim):
             report_tgt_words += num_words
             report_src_words += sum(batch[0][1])
             total_loss += loss
+            total_KLD += KLD.data[0]
+            total_KLD_obj += KLD_obj.data[0]
             total_num_correct += num_correct
             total_words += num_words
             if i % opt.log_interval == -1 % opt.log_interval:
@@ -240,33 +249,51 @@ def trainModel(model, trainData, validData, dataset, optim):
                       report_tgt_words/(time.time()-start),
                       time.time()-start_time))
 
-                report_loss = report_tgt_words = report_src_words = report_num_correct = 0
+                report_loss = report_KLD = report_KLD_obj = report_tgt_words = report_src_words = report_num_correct = 0
                 start = time.time()
 
-        return total_loss / total_words, total_num_correct / total_words
+        return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words
 
+    train_losses, train_KLDs, train_KLD_objs, train_accs = [], [], [], []
+    valid_losses, valid_KLDs, valid_accs = [], [], []
     for epoch in range(opt.start_epoch, opt.epochs + 1):
         print('')
 
         #  (1) train for one epoch on the training set
-        train_loss, train_acc = trainEpoch(epoch)
+        train_loss, train_KLD, train_KLD_obj, train_acc = trainEpoch(epoch)
+
+        train_losses += [train_loss]
+        train_KLDs += [train_KLD]
+        train_KLD_objs += [train_KLD_obj]
+        train_accs += [train_acc]
+
         train_ppl = math.exp(min(train_loss, 100))
         print('Train perplexity: %g' % train_ppl)
+        print('Train KL Divergence: %g' % train_KLD)
+        print('Train KL divergence objective: %g' % train_KLD_obj)
         print('Train accuracy: %g' % (train_acc*100))
 
         #  (2) evaluate on the validation set
-        valid_loss, valid_acc = eval(model, criterion, validData)
+        valid_loss, valid_KLD, valid_acc = eval(model, criterion, validData)
+
+        valid_losses += [valid_loss]
+        valid_KLDs += [valid_KLD]
+        valid_accs += [valid_acc]
+
         valid_ppl = math.exp(min(valid_loss, 100))
         print('Validation perplexity: %g' % valid_ppl)
+        print('Validation KL Divergence: %g' % valid_KLD)
         print('Validation accuracy: %g' % (valid_acc*100))
 
-        #  (3) update the learning rate
+        #  (3) plot statistics
+
+        #  (4) update the learning rate
         optim.updateLearningRate(valid_loss, epoch)
 
         model_state_dict = model.module.state_dict() if len(opt.gpus) > 1 else model.state_dict()
         model_state_dict = {k: v for k, v in model_state_dict.items() if 'generator' not in k}
         generator_state_dict = model.generator.module.state_dict() if len(opt.gpus) > 1 else model.generator.state_dict()
-        #  (4) drop a checkpoint
+        #  (5) drop a checkpoint
         checkpoint = {
             'model': model_state_dict,
             'generator': generator_state_dict,

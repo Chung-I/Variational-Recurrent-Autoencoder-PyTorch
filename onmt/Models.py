@@ -132,8 +132,7 @@ class NMTModel(nn.Module):
         enc_hidden, _ = self.encoder(x)
         #  the encoder hidden is a tensor tuple with dimension (layers*directions) x batch x dim
         #  we need to convert it to batch x (2*layers*directions*dim)
-        enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), 2)
-        enc_hidden = enc_hidden.transpose(0,1).contiguous() # convert to batch major
+        enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), 2).transpose(0,1).contiguous() 
         enc_hidden = enc_hidden.view(enc_hidden.size(0), -1)
         mu = self.prelu_mu(self.encoder_to_mu(enc_hidden))
         logvar = self.prelu_logvar(self.encoder_to_logvar(enc_hidden))
@@ -154,11 +153,10 @@ class NMTModel(nn.Module):
         return Variable(z.data.new(*h_size).zero_(), requires_grad=False)
 
     def decode(self, z, tgt):
-        decoder_state = self.prelu_dec(self.latent_to_decoder(z))
+        decoder_state = torch.chunk(self.prelu_dec(self.latent_to_decoder(z)).view(self.layers, z.size(0), -1), 2, 2)
         # the decoder state is batch x (2*layers*directions*dim)
         # we need to convert it to a tensor tuple with dimesion layers x batch x (directions * dim)
-        decoder_state = decoder_state.view(self.layers, decoder_state.size(0), -1)
-        decoder_state = torch.split(decoder_state, decoder_state.size(-1)//2, 2)
+        #decoder_state = torch.split(decoder_state, decoder_state.size(-1)//2, 2)
 
         init_output = self.make_init_decoder_output(z)
 

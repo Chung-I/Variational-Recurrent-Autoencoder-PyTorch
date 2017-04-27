@@ -2,7 +2,7 @@ import onmt
 import torch.nn as nn
 import torch
 from torch.autograd import Variable
-
+import pdb
 
 class Translator(object):
     def __init__(self, opt):
@@ -62,6 +62,89 @@ class Translator(object):
         #            _, maxIndex = attn[i].max(0)
         #            tokens[i] = src[maxIndex[0]]
         return tokens
+    def beam_decode(self, encStates):
+        pdb.set_trace()
+        batchSize = encStates.size(0)
+        beamSize = self.opt.beam_size
+        rnnSize = self.model.decoder.hidden_size
+        beam = [onmt.Beam(beamSize, self.opt.cuda) for k in range(batchSize)]
+        decStates = self.model.prelu_dec(self.model.latent_to_decoder(encStates))
+        decStates = decStates.view(self.model.layers, decStates.size(0), -1)
+        decStates = torch.split(decStates, decStates.size(-1)//2, 2)
+        #decOut = self.model.make_init_decoder_output(context)
+        decStates = (Variable(decStates[0].data.repeat(1, beamSize, 1)),
+                     Variable(decStates[1].data.repeat(1, beamSize, 1)))
+        context = Variable(encStates.data.repeat(beamSize, 1))
+        decOut = self.model.make_init_decoder_output(context)
+
+        #padMask = srcBatch.data.eq(onmt.Constants.PAD).t().unsqueeze(0).repeat(beamSize, 1, 1)
+
+        batchIdx = list(range(batchSize))
+        remainingSents = batchSize
+        for i in range(self.opt.max_sent_length):
+            # Prepare decoder input.
+            input = torch.stack([b.getCurrentState() for b in beam
+                               if not b.done]).t().contiguous().view(1, -1)
+
+            decOut, decStates = self.model.decoder(Variable(input, volatile=True), decStates, decOut)
+            # decOut: 1 x (beam*batch) x numWords
+            decOut = decOut.squeeze(0)
+            out = self.model.generator.forward(decOut)
+
+            # batch x beam x numWords
+            wordLk = out.view(beamSize, remainingSents, -1).transpose(0, 1).contiguous()
+
+            active = []
+            for b in range(batchSize):
+                if beam[b].done:
+                    continue
+
+                idx = batchIdx[b]
+                if not beam[b].advance(wordLk.data[idx]):
+                    active += [b]
+
+                for decState in decStates:  # iterate over h, c
+                    # layers x beam*sent x dim
+                    sentStates = decState.view(
+                        -1, beamSize, remainingSents, decState.size(2))[:, :, idx]
+                    sentStates.data.copy_(
+                        sentStates.data.index_select(1, beam[b].getCurrentOrigin()))
+
+            if not active:
+                break
+
+            # in this section, the sentences that are still active are
+            # compacted so that the decoder is not run on completed sentences
+            activeIdx = self.tt.LongTensor([batchIdx[k] for k in active])
+            batchIdx = {beam: idx for idx, beam in enumerate(active)}
+
+            def updateActive(t):
+                # select only the remaining active sentences
+                view = t.data.view(-1, remainingSents, rnnSize)
+                newSize = list(t.size())
+                newSize[-2] = newSize[-2] * len(activeIdx) // remainingSents
+                return Variable(view.index_select(1, activeIdx) \
+                                    .view(*newSize), volatile=True)
+
+            decStates = (updateActive(decStates[0]), updateActive(decStates[1]))
+            decOut = updateActive(decOut)
+            #padMask = padMask.index_select(1, activeIdx)
+
+            remainingSents = len(active)
+
+        #  (4) package everything up
+
+        allHyp, allScores = [], []
+        n_best = self.opt.n_best
+
+        for b in range(batchSize):
+            scores, ks = beam[b].sortBest()
+
+            allScores += [scores[:n_best]]
+            hyps = [beam[b].getHyp(k) for k in ks[:n_best]]
+            allHyp += [hyps]
+        return allHyp, allScores
+
 
     def translateBatch(self, srcBatch, tgtBatch):
         batchSize = srcBatch[0].size(1)
@@ -218,10 +301,6 @@ class Translator(object):
         #  (3) convert indexes to words
         predBatch = []
         for b in range(src[0].size(1)):
-            #predBatch.append(
-            #    [self.buildTargetTokens(pred[b][n], srcBatch[b], attn[b][n])
-            #            for n in range(self.opt.n_best)]
-            #)
             predBatch.append(
                 [self.buildTargetTokens(pred[b][n], srcBatch[b])
                         for n in range(self.opt.n_best)]
@@ -229,13 +308,21 @@ class Translator(object):
 
         return predBatch, predScore, goldScore
 
-    def interpolate(self, srcBatch):
-        tgtBatch = srcBatch
-        dataset = self.buildData(srcBatch, [None for _ in srcBatch])
+    def interpolate(self, srcBatch, num_pts):
+        dataset = self.buildData(srcBatch, [])
         src, _, indices = dataset[0]
         mu, logvar = self.model.encode(src)
         start, end = mu[0].data, mu[1].data
-        points = Variable(torch.cat([torch.lerp(start, end , w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 1))
-        decOut = self.model.decode(
-            points, tgtBatch[:-1])
+        points = Variable(torch.cat([torch.lerp(start, end , w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 0))
+        pred, predScore = self.beam_decode(points)
+        indices = [i for i in range(0, num_pts)] if indices[0] < indices[1] else [i for i in range(num_pts-1, -1, -1)]
+        pred, predScore = list(zip(*sorted(zip(pred, predScore, indices), key=lambda x: x[-1])))[:-1]
+        predBatch = []
+        for b in range(points.size(0)):
+            predBatch.append(
+                [self.tgt_dict.convertToLabels(pred[b][n], onmt.Constants.EOS)[:-1]
+                    for n in range(self.opt.n_best)]
+            )
+        return predBatch, predScore
+
         
