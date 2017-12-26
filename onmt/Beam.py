@@ -35,7 +35,7 @@ class Beam(object):
         self.nextYs[0][0] = onmt.Constants.BOS
 
         # The attentions (matrix) for each time.
-        self.attn = []
+        # self.attn = []
 
     # Get the outputs for the current timestep.
     def getCurrentState(self):
@@ -54,7 +54,8 @@ class Beam(object):
     #     * `attnOut`- attention at the last step
     #
     # Returns: True if beam search is complete.
-    def advance(self, wordLk, attnOut):
+    #def advance(self, wordLk, attnOut):
+    def advance(self, wordLk):
 
         numWords = wordLk.size(1)
 
@@ -74,7 +75,7 @@ class Beam(object):
         prevK = bestScoresId / numWords
         self.prevKs.append(prevK)
         self.nextYs.append(bestScoresId - prevK * numWords)
-        self.attn.append(attnOut.index_select(0, prevK))
+        #self.attn.append(attnOut.index_select(0, prevK))
 
         # End condition is when top-of-beam is EOS.
         if self.nextYs[-1][0] == onmt.Constants.EOS:
@@ -101,11 +102,13 @@ class Beam(object):
     #     1. The hypothesis
     #     2. The attention at each time step.
     def getHyp(self, k):
-        hyp, attn = [], []
+        #hyp, attn = [], []
+        hyp = []
         # print(len(self.prevKs), len(self.nextYs), len(self.attn))
         for j in range(len(self.prevKs) - 1, -1, -1):
             hyp.append(self.nextYs[j+1][k])
-            attn.append(self.attn[j][k])
+            #attn.append(self.attn[j][k])
             k = self.prevKs[j][k]
 
-        return hyp[::-1], torch.stack(attn[::-1])
+        #return hyp[::-1], torch.stack(attn[::-1])
+        return hyp[::-1]

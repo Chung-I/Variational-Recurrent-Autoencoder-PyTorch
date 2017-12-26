@@ -3,3 +3,8 @@ multi-bleu.perl
 data
 *.pt
 *.pyc
+*pred
+nohup.out
+*.sh
+*.txt
+all_m
