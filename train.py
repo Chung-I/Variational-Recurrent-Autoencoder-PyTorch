@@ -8,6 +8,7 @@ from torch import cuda
 from torch.autograd import Variable
 import math
 import time
+import os
 import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description='train.py')
@@ -125,6 +126,38 @@ if torch.cuda.is_available() and not opt.gpus:
 if opt.gpus:
     cuda.set_device(opt.gpus[0])
 
+def plot_stats(stats):
+    metrics = ['loss', 'KLD', 'KLD_obj', 'num_correct']
+    model_dir = opt.save_model.split("/")[0]
+    for metric in metrics:
+        plt.plot([value / num_words for value, num_words in zip(stats[metric], stats['num_words'])])
+        plt.xlabel("step")
+        if metric is "num_correct":
+            plt.title("step accuracy")
+            plt.ylabel("percentage")
+        else:
+            plt.title("step " + metric.replace("_", " "))
+            plt.ylabel("nats/word")
+        plt.savefig(os.path.join(model_dir, metric + ".jpg"))
+        plt.close('all')
+    valid_metrics = ['valid_loss', 'valid_KLD', 'valid_accuracy']
+    for metric in valid_metrics:
+        plt.plot(stats['valid_step'], stats[metric])
+        plt.xlabel("step")
+        if metric is "valid_accuracy":
+            plt.ylabel("percentage")
+        else:
+            plt.ylabel("nats/word")
+        plt.title("step " + metric.replace("_", " "))
+        plt.savefig(os.path.join(model_dir, metric + ".jpg"))
+        plt.close('all')
+    plt.plot(stats['kl_rate'])
+    plt.xlabel("step")
+    plt.ylabel("percentage")
+    plt.title("KL rate")
+    plt.savefig(os.path.join(model_dir,"kl_rate.jpg"))
+    plt.close('all')
+
 def NMTCriterion(vocabSize):
     weight = torch.ones(vocabSize)
     weight[onmt.Constants.PAD] = 0
@@ -181,7 +214,7 @@ def eval(model, criterion, data):
     model.train()
     return total_loss / total_words, total_KLD / total_words, total_num_correct / total_words
 
-def trainModel(model, trainData, validData, dataset, optim):
+def trainModel(model, trainData, validData, dataset, optim, stats):
     print(model)
     model.train()
 
@@ -198,10 +231,8 @@ def trainModel(model, trainData, validData, dataset, optim):
         # shuffle mini batch order
         batchOrder = torch.randperm(len(trainData))
 
-        total_loss, total_words, total_num_correct = 0, 0, 0
-        total_KLD, total_KLD_obj = 0, 0
-        report_loss, report_tgt_words, report_src_words, report_num_correct = 0, 0, 0, 0
-        report_KLD, report_KLD_obj = 0, 0
+        total_loss, total_KLD, total_KLD_obj, total_words, total_num_correct = 0, 0, 0, 0, 0
+        report_loss, report_KLD, report_KLD_obj, report_tgt_words, report_src_words, report_num_correct = 0, 0, 0, 0, 0, 0
         start = time.time()
         for i in range(len(trainData)):
 
@@ -237,35 +268,34 @@ def trainModel(model, trainData, validData, dataset, optim):
             total_KLD_obj += KLD_obj.data[0]
             total_num_correct += num_correct
             total_words += num_words
+            stats['loss'].append(loss)
+            stats['KLD'].append(KLD.data[0])
+            stats['KLD_obj'].append(KLD_obj.data[0])
+            stats['kl_rate'].append(kl_rate)
+            stats['num_words'].append(num_words)
+            stats['num_correct'].append(num_correct)
             if i % opt.log_interval == -1 % opt.log_interval:
                 print("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; KLD: %6.2f; KLD obj: %6.2f; kl rate: %2.6f; %3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed" %
                       (epoch, i+1, len(trainData),
                       report_num_correct / report_tgt_words * 100,
                       math.exp(report_loss / report_tgt_words),
-                      report_KLD,
-                      report_KLD_obj,
+                      report_KLD / report_tgt_words,
+                      report_KLD_obj / report_tgt_words,
                       kl_rate,
                       report_src_words/(time.time()-start),
                       report_tgt_words/(time.time()-start),
                       time.time()-start_time))
-
                 report_loss = report_KLD = report_KLD_obj = report_tgt_words = report_src_words = report_num_correct = 0
+
                 start = time.time()
 
-        return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words
+        return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words        
 
-    train_losses, train_KLDs, train_KLD_objs, train_accs = [], [], [], []
-    valid_losses, valid_KLDs, valid_accs = [], [], []
     for epoch in range(opt.start_epoch, opt.epochs + 1):
         print('')
 
         #  (1) train for one epoch on the training set
         train_loss, train_KLD, train_KLD_obj, train_acc = trainEpoch(epoch)
-
-        train_losses += [train_loss]
-        train_KLDs += [train_KLD]
-        train_KLD_objs += [train_KLD_obj]
-        train_accs += [train_acc]
 
         train_ppl = math.exp(min(train_loss, 100))
         print('Train perplexity: %g' % train_ppl)
@@ -275,10 +305,10 @@ def trainModel(model, trainData, validData, dataset, optim):
 
         #  (2) evaluate on the validation set
         valid_loss, valid_KLD, valid_acc = eval(model, criterion, validData)
-
-        valid_losses += [valid_loss]
-        valid_KLDs += [valid_KLD]
-        valid_accs += [valid_acc]
+        stats['valid_loss'].append(valid_loss)
+        stats['valid_KLD'].append(valid_KLD)
+        stats['valid_accuracy'].append(valid_acc)
+        stats['valid_step'].append(epoch * len(trainData))
 
         valid_ppl = math.exp(min(valid_loss, 100))
         print('Validation perplexity: %g' % valid_ppl)
@@ -286,6 +316,7 @@ def trainModel(model, trainData, validData, dataset, optim):
         print('Validation accuracy: %g' % (valid_acc*100))
 
         #  (3) plot statistics
+        plot_stats(stats)
 
         #  (4) update the learning rate
         optim.updateLearningRate(valid_loss, epoch)
@@ -300,7 +331,8 @@ def trainModel(model, trainData, validData, dataset, optim):
             'dicts': dataset['dicts'],
             'opt': opt,
             'epoch': epoch,
-            'optim': optim
+            'optim': optim,
+            'stats': stats
         }
         torch.save(checkpoint,
                    '%s_acc_%.2f_ppl_%.2f_e%d.pt' % (opt.save_model, 100*valid_acc, valid_ppl, epoch))
@@ -390,11 +422,14 @@ def main():
 
     if opt.train_from or opt.train_from_state_dict:
         optim.optimizer.load_state_dict(checkpoint['optim'].optimizer.state_dict())
+        stats = checkpoints['stats']
+    else:
+        stats = {'loss': [], 'KLD': [], 'KLD_obj': [], 'kl_rate': [], 'num_words': [], 'num_correct': [], 'valid_loss': [], 'valid_KLD': [], 'valid_accuracy': [], 'valid_step': []}
 
     nParams = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % nParams)
 
-    trainModel(model, trainData, validData, dataset, optim)
+    trainModel(model, trainData, validData, dataset, optim, stats)
 
 
 if __name__ == "__main__":

@@ -119,6 +119,7 @@ class NMTModel(nn.Module):
         self.decoder = decoder
         self.layers = opt.layers
         self.gpus = opt.gpus
+        self.latent_size = opt.latent_size
         self.feed_gt_prob = opt.feed_gt_prob
         concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
         self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)

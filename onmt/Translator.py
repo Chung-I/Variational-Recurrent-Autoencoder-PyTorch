@@ -2,7 +2,19 @@ import onmt
 import torch.nn as nn
 import torch
 from torch.autograd import Variable
-import pdb
+import numpy as np
+
+def slerp(low, high, val):
+    """Code from https://github.com/soumith/dcgan.torch/issues/14"""
+    low = low.numpy()
+    high = high.numpy()
+    omega = np.arccos(np.clip(np.dot(low/np.linalg.norm(low), high/np.linalg.norm(high)), -1, 1))
+    so = np.sin(omega)
+    if so == 0:
+        return (1.0-val) * low + val * high # L'Hopital's rule/LERP
+    return torch.from_numpy(np.sin((1.0-val)*omega) / so * low + np.sin(val*omega) / so * high)
+
+
 
 class Translator(object):
     def __init__(self, opt):
@@ -63,7 +75,6 @@ class Translator(object):
         #            tokens[i] = src[maxIndex[0]]
         return tokens
     def beam_decode(self, encStates):
-        pdb.set_trace()
         batchSize = encStates.size(0)
         beamSize = self.opt.beam_size
         rnnSize = self.model.decoder.hidden_size
@@ -313,7 +324,8 @@ class Translator(object):
         src, _, indices = dataset[0]
         mu, logvar = self.model.encode(src)
         start, end = mu[0].data, mu[1].data
-        points = Variable(torch.cat([torch.lerp(start, end , w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 0))
+        #points = Variable(torch.cat([torch.lerp(start, end , w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 0))
+        points = Variable(torch.cat([slerp(start, end, w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 0))
         pred, predScore = self.beam_decode(points)
         indices = [i for i in range(0, num_pts)] if indices[0] < indices[1] else [i for i in range(num_pts-1, -1, -1)]
         pred, predScore = list(zip(*sorted(zip(pred, predScore, indices), key=lambda x: x[-1])))[:-1]
@@ -325,4 +337,16 @@ class Translator(object):
             )
         return predBatch, predScore
 
+    def sample(self, num_pts):
+        points = Variable(self.tt.FloatTensor(num_pts, self.model.latent_size).normal_())
+        pred, predScore = self.beam_decode(points)
+        indices = [i for i in range(0, num_pts)] 
+        pred, predScore = list(zip(*sorted(zip(pred, predScore, indices), key=lambda x: x[-1])))[:-1]
+        predBatch = []
+        for b in range(points.size(0)):
+            predBatch.append(
+                [self.tgt_dict.convertToLabels(pred[b][n], onmt.Constants.EOS)[:-1]
+                    for n in range(self.opt.n_best)]
+            )
+        return predBatch, predScore
         
