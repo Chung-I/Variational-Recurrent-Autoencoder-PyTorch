@@ -128,7 +128,7 @@ if opt.gpus:
 
 def plot_stats(stats):
     metrics = ['loss', 'KLD', 'KLD_obj', 'num_correct']
-    model_dir = opt.save_model.split("/")[0]
+    model_dir = os.path.dirname(opt.save_model)
     for metric in metrics:
         plt.plot([value / num_words for value, num_words in zip(stats[metric], stats['num_words'])])
         plt.xlabel("step")
@@ -173,7 +173,6 @@ def KLDLoss(mu, logvar):
 def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
     # compute generations one piece at a time
     num_correct, loss = 0, 0
-    outputs = Variable(outputs.data, requires_grad=(not eval), volatile=eval)
 
     batch_size = outputs.size(1)
     outputs_split = torch.split(outputs, opt.max_generator_batches)
@@ -185,9 +184,7 @@ def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
         pred_t = scores_t.max(1)[1]
         num_correct_t = pred_t.data.eq(targ_t.data).masked_select(targ_t.ne(onmt.Constants.PAD).data).sum()
         num_correct += num_correct_t
-        loss += loss_t.data[0]
-        if not eval:
-            loss_t.div(batch_size).backward()
+        loss += loss_t
 
     grad_output = None if outputs.grad is None else outputs.grad.data
     return loss, grad_output, num_correct
@@ -246,29 +243,29 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
             loss, gradOutput, num_correct = memoryEfficientLoss(
                     outputs, targets, model.generator, criterion)
 
-            outputs.backward(gradOutput, retain_variables=True)
-
             KLD = KLDLoss(mu, logvar)
             kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
             KLD_obj = kl_rate * KLD
-            KLD_obj.backward()
+
+            elbo = KLD_obj + loss
+            elbo.backward()
 
             # update the parameters
             optim.step()
 
             num_words = targets.data.ne(onmt.Constants.PAD).sum()
-            report_loss += loss
+            report_loss += loss.data[0]
             report_KLD += KLD.data[0]
             report_KLD_obj += KLD_obj.data[0]
             report_num_correct += num_correct
             report_tgt_words += num_words
             report_src_words += sum(batch[0][1])
-            total_loss += loss
+            total_loss += loss.data[0]
             total_KLD += KLD.data[0]
             total_KLD_obj += KLD_obj.data[0]
             total_num_correct += num_correct
             total_words += num_words
-            stats['loss'].append(loss)
+            stats['loss'].append(loss.data[0])
             stats['KLD'].append(KLD.data[0])
             stats['KLD_obj'].append(KLD_obj.data[0])
             stats['kl_rate'].append(kl_rate)
@@ -305,6 +302,7 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
 
         #  (2) evaluate on the validation set
         valid_loss, valid_KLD, valid_acc = eval(model, criterion, validData)
+        valid_loss = valid_loss.data[0]
         stats['valid_loss'].append(valid_loss)
         stats['valid_KLD'].append(valid_KLD)
         stats['valid_accuracy'].append(valid_acc)
