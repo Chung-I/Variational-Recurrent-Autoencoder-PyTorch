@@ -95,7 +95,6 @@ class Decoder(nn.Module):
 
         # n.b. you can increase performance if you compute W_ih * x for all
         # iterations in parallel, but that's only possible if
-        # self.input_feed=False
         outputs = []
         output = init_output
         for emb_t in emb.split(1):
@@ -154,14 +153,14 @@ class NMTModel(nn.Module):
         return Variable(z.data.new(*h_size).zero_(), requires_grad=False)
 
     def decode(self, z, tgt):
-        decoder_state = torch.chunk(self.prelu_dec(self.latent_to_decoder(z)).view(self.layers, z.size(0), -1), 2, 2)
+        decStates = self.prelu_dec(self.latent_to_decoder(z))
+        decStates = decStates.view(self.layers, z.size(0), -1)
+        decStates = torch.chunk(decStates)
         # the decoder state is batch x (2*layers*directions*dim)
         # we need to convert it to a tensor tuple with dimesion layers x batch x (directions * dim)
-        #decoder_state = torch.split(decoder_state, decoder_state.size(-1)//2, 2)
-
         init_output = self.make_init_decoder_output(z)
 
-        x, dec_hidden = self.decoder(tgt, decoder_state, init_output)
+        x, dec_hidden = self.decoder(tgt, decStates, init_output)
         return x
     
     def _fix_enc_hidden(self, h):
@@ -196,21 +195,5 @@ class NMTModel(nn.Module):
         mu, logvar = self.encode(src)
         z = self.reparameterize(mu, logvar)
         out = self.decode(mu, tgt)
-        #enc_hidden, _ = self.encoder(src)
-        #enc_hidden, _ = self.encoder(x)
-        #init_output = self.make_init_decoder_output(enc_hidden[0])
-        #enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), 2)
-        #enc_hidden = enc_hidden.transpose(0,1).contiguous() # convert to batch major
-        #enc_hidden = enc_hidden.view(enc_hidden.size(0), -1)
-        #mu = self.prelu_mu(self.encoder_to_mu(enc_hidden))
-        #decoder_state = self.prelu_dec(self.latent_to_decoder(mu))
-        #decoder_state = decoder_state.view(self.layers, decoder_state.size(0), -1)
-        #decoder_state = torch.chunk(decoder_state, 2, 2)
-
-        #decoder_state = (self._fix_enc_hidden(decoder_state[0]),
-        #                 self._fix_enc_hidden(decoder_state[1]))
-
-        #out, dec_hidden = self.decoder(tgt, decoder_state, init_output)
-        #out, dec_hidden = self.decoder(tgt, enc_hidden, init_output)
 
         return out, mu, logvar
