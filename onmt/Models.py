@@ -4,10 +4,11 @@ from torch.autograd import Variable
 import onmt.modules
 from torch.nn.utils.rnn import pad_packed_sequence as unpack
 from torch.nn.utils.rnn import pack_padded_sequence as pack
+import math
 
 class Encoder(nn.Module):
 
-    def __init__(self, opt, dicts):
+    def __init__(self, opt, word_lut):
         self.layers = opt.layers
         self.num_directions = 2 if opt.brnn else 1
         assert opt.rnn_size % self.num_directions == 0
@@ -15,9 +16,7 @@ class Encoder(nn.Module):
         input_size = opt.word_vec_size
 
         super(Encoder, self).__init__()
-        self.word_lut = nn.Embedding(dicts.size(),
-                                  opt.word_vec_size,
-                                  padding_idx=onmt.Constants.PAD)
+        self.word_lut = word_lut
         self.rnn = nn.LSTM(input_size, self.hidden_size,
                         num_layers=opt.layers,
                         dropout=opt.dropout,
@@ -69,18 +68,17 @@ class StackedLSTM(nn.Module):
 
 class Decoder(nn.Module):
 
-    def __init__(self, opt, dicts):
+    def __init__(self, opt, word_lut, generator):
         self.layers = opt.layers
-        self.input_feed = opt.input_feed
+        self.dynamic_decode = opt.dynamic_decode
+        self.ss = opt.ss
+
         input_size = opt.word_vec_size
-        if self.input_feed:
-            input_size += opt.rnn_size
 
         super(Decoder, self).__init__()
-        self.word_lut = nn.Embedding(dicts.size(),
-                                  opt.word_vec_size,
-                                  padding_idx=onmt.Constants.PAD)
         self.rnn = StackedLSTM(opt.layers, input_size, opt.rnn_size, opt.dropout)  
+        self.word_lut = word_lut
+        self.generator = generator
         self.dropout = nn.Dropout(opt.dropout)
 
         self.hidden_size = opt.rnn_size
@@ -90,23 +88,26 @@ class Decoder(nn.Module):
             pretrained = torch.load(opt.pre_word_vecs_dec)
             self.word_lut.weight.data.copy_(pretrained)
 
-    def forward(self, input, hidden, init_output):
+    def forward(self, input, hidden, init_output, step=0):
         emb = self.word_lut(input)
 
         # n.b. you can increase performance if you compute W_ih * x for all
         # iterations in parallel, but that's only possible if
         outputs = []
-        output = init_output
-        for emb_t in emb.split(1):
-            emb_t = emb_t.squeeze(0)
-            if self.input_feed:
-                emb_t = torch.cat((emb_t, output), 1)
+        for i, emb_t in enumerate(emb.split(1)):
+            if not self.dynamic_decode or i == 0:
+                input_t = emb_t.squeeze(0)
 
-            output, hidden = self.rnn(emb_t, hidden)
+            output, hidden = self.rnn(input_t, hidden)
             output = self.dropout(output)
-            outputs += [output]
+            logit = self.generator(output)
+            if self.dynamic_decode:
+                _, indices = logit.max(-1)
+                input_t = self.word_lut(indices)
+            outputs += [logit]
 
         outputs = torch.stack(outputs)
+
         return outputs, hidden
 
 
@@ -114,12 +115,13 @@ class NMTModel(nn.Module):
 
     def __init__(self, encoder, decoder, opt):
         super(NMTModel, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
+        self.add_module('encoder', encoder)
+        self.add_module('decoder', decoder)
         self.layers = opt.layers
         self.gpus = opt.gpus
         self.latent_size = opt.latent_size
         self.feed_gt_prob = opt.feed_gt_prob
+        self.dynamic_decode = opt.dynamic_decode
         concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
         self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)
         self.encoder_to_logvar = nn.Linear(concat_hidden_size, opt.latent_size)
@@ -152,15 +154,15 @@ class NMTModel(nn.Module):
         h_size = (batch_size, self.decoder.hidden_size)
         return Variable(z.data.new(*h_size).zero_(), requires_grad=False)
 
-    def decode(self, z, tgt):
+    def decode(self, z, tgt, step):
         decStates = self.prelu_dec(self.latent_to_decoder(z))
-        decStates = decStates.view(self.layers, z.size(0), -1)
-        decStates = torch.chunk(decStates)
         # the decoder state is batch x (2*layers*directions*dim)
         # we need to convert it to a tensor tuple with dimesion layers x batch x (directions * dim)
+        decStates = decStates.view(self.layers, z.size(0), -1)
+        decStates = torch.chunk(decStates, 2, 2)
         init_output = self.make_init_decoder_output(z)
 
-        x, dec_hidden = self.decoder(tgt, decStates, init_output)
+        x, dec_hidden = self.decoder(tgt, decStates, init_output, step)
         return x
     
     def _fix_enc_hidden(self, h):
@@ -187,13 +189,13 @@ class NMTModel(nn.Module):
         added = (1 - samples) * onmt.Constants.UNK
         return torch.mul(seqs, samples.long()) + added.long()
 
-    def forward(self, input):
+    def forward(self, input, step=0):
         src = input[0]
-        tgt = input[1][:-1]  # exclude last target from inputs
+        tgt = input[1][:-1]
         if self.training and self.feed_gt_prob < 1:
             tgt = self.replace_by_unk(tgt, self.feed_gt_prob)
         mu, logvar = self.encode(src)
         z = self.reparameterize(mu, logvar)
-        out = self.decode(mu, tgt)
+        out = self.decode(mu, tgt, step)
 
         return out, mu, logvar

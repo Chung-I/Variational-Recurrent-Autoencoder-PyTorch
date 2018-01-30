@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch
 from torch.autograd import Variable
 import numpy as np
+import pdb
 
 def slerp(low, high, val):
     """Code from https://github.com/soumith/dcgan.torch/issues/14"""
@@ -27,25 +28,24 @@ class Translator(object):
         self.src_dict = checkpoint['dicts']['src']
         self.tgt_dict = checkpoint['dicts']['tgt']
 
-        encoder = onmt.Models.Encoder(model_opt, self.src_dict)
-        decoder = onmt.Models.Decoder(model_opt, self.tgt_dict)
-        model = onmt.Models.NMTModel(encoder, decoder, model_opt)
-
         generator = nn.Sequential(
             nn.Linear(model_opt.rnn_size, self.tgt_dict.size()),
             nn.LogSoftmax())
+        word_lut = nn.Embedding(self.src_dict.size(),
+                                model_opt.word_vec_size,
+                                padding_idx=onmt.Constants.PAD)
+        encoder = onmt.Models.Encoder(model_opt, word_lut)
+        decoder = onmt.Models.Decoder(model_opt, word_lut, generator)
+
+        model = onmt.Models.NMTModel(encoder, decoder, model_opt)
 
         model.load_state_dict(checkpoint['model'])
-        generator.load_state_dict(checkpoint['generator'])
 
         if opt.cuda:
             model.cuda()
-            generator.cuda()
         else:
             model.cpu()
-            generator.cpu()
 
-        model.generator = generator
 
         self.model = model
         self.model.eval()
@@ -94,7 +94,7 @@ class Translator(object):
             decOut, decStates = self.model.decoder(Variable(input, volatile=True), decStates, decOut)
             # decOut: 1 x (beam*batch) x numWords
             decOut = decOut.squeeze(0)
-            out = self.model.generator.forward(decOut)
+            out = decOut
 
             # batch x beam x numWords
             wordLk = out.view(beamSize, remainingSents, -1).transpose(0, 1).contiguous()
@@ -132,7 +132,7 @@ class Translator(object):
                                     .view(*newSize), volatile=True)
 
             decStates = (updateActive(decStates[0]), updateActive(decStates[1]))
-            decOut = updateActive(decOut)
+            #decOut = updateActive(decOut)
 
             remainingSents = len(active)
 
@@ -172,7 +172,7 @@ class Translator(object):
             decOut = self.model.decode(
                 decStates, tgtBatch[:-1])
             for dec_t, tgt_t in zip(decOut, tgtBatch[1:].data):
-                gen_t = self.model.generator.forward(dec_t)
+                gen_t = dec_t
                 tgt_t = tgt_t.unsqueeze(1)
                 scores = gen_t.data.gather(1, tgt_t)
                 scores.masked_fill_(tgt_t.eq(onmt.Constants.PAD), 0)
@@ -204,7 +204,7 @@ class Translator(object):
             decOut, decStates = self.model.decoder(Variable(input, volatile=True), decStates, decOut)
             # decOut: 1 x (beam*batch) x numWords
             decOut = decOut.squeeze(0)
-            out = self.model.generator.forward(decOut)
+            out = decOut
 
             # batch x beam x numWords
             wordLk = out.view(beamSize, remainingSents, -1).transpose(0, 1).contiguous()
@@ -242,7 +242,7 @@ class Translator(object):
                                     .view(*newSize), volatile=True)
 
             decStates = (updateActive(decStates[0]), updateActive(decStates[1]))
-            decOut = updateActive(decOut)
+            #decOut = updateActive(decOut)
             padMask = padMask.index_select(1, activeIdx)
 
             remainingSents = len(active)
@@ -259,7 +259,6 @@ class Translator(object):
             hyps = [beam[b].getHyp(k) for k in ks[:n_best]]
             allHyp += [hyps]
 
-        #return allHyp, allScores, allAttn, goldScores
         return allHyp, allScores, goldScores
 
     def translate(self, srcBatch, goldBatch):

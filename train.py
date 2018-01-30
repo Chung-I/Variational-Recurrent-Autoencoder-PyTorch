@@ -38,6 +38,8 @@ parser.add_argument('-word_vec_size', type=int, default=500,
                     help='Word embedding sizes')
 parser.add_argument('-latent_size', type=int, default=16,
                     help='Latent space sizes')
+parser.add_argument('-dynamic_decode', action='store_true',
+                    help='feed outputs of previous steps instead of ground truth')
 parser.add_argument('-input_feed', type=int, default=1,
                     help="""Feed the context vector at each time step as
                     additional input (via concatenation with the word
@@ -83,6 +85,8 @@ parser.add_argument('-extra_shuffle', action="store_true",
                     shuffle and re-assign mini-batches""")
 parser.add_argument('-k', type=int, default=50000,
                     help='sigmoid increase rate for kl rate. r = 1 / (1 + k * exp(-i/k))')
+parser.add_argument('-ss', type=int, default=50000,
+                    help='sigmoid increase rate for scheduled sampling.')
 
 #learning rate
 parser.add_argument('-learning_rate', type=float, default=1e-4,
@@ -170,7 +174,7 @@ def KLDLoss(mu, logvar):
     KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
     return torch.sum(KLD_element).mul_(-0.5)
 
-def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
+def memoryEfficientLoss(outputs, targets, crit, eval=False):
     # compute generations one piece at a time
     num_correct, loss = 0, 0
 
@@ -179,9 +183,8 @@ def memoryEfficientLoss(outputs, targets, generator, crit, eval=False):
     targets_split = torch.split(targets, opt.max_generator_batches)
     for i, (out_t, targ_t) in enumerate(zip(outputs_split, targets_split)):
         out_t = out_t.view(-1, out_t.size(2))
-        scores_t = generator(out_t)
-        loss_t = crit(scores_t, targ_t.view(-1))
-        pred_t = scores_t.max(1)[1]
+        loss_t = crit(out_t, targ_t.view(-1))
+        pred_t = out_t.max(1)[1]
         num_correct_t = pred_t.data.eq(targ_t.data).masked_select(targ_t.ne(onmt.Constants.PAD).data).sum()
         num_correct += num_correct_t
         loss += loss_t
@@ -201,7 +204,7 @@ def eval(model, criterion, data):
         outputs, mu, logvar = model(batch)
         targets = batch[1][1:]  # exclude <s> from targets
         loss, _, num_correct = memoryEfficientLoss(
-                outputs, targets, model.generator, criterion, eval=True)
+                outputs, targets, criterion, eval=True)
         KLD = KLDLoss(mu, logvar)
         total_loss += loss
         total_KLD += KLD.data[0]
@@ -238,10 +241,10 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
             batch = trainData[batchIdx][:-1] # exclude original indices
 
             model.zero_grad()
-            outputs, mu, logvar = model(batch)
+            outputs, mu, logvar = model(batch, total_step)
             targets = batch[1][1:]  # exclude <s> from targets
             loss, gradOutput, num_correct = memoryEfficientLoss(
-                    outputs, targets, model.generator, criterion)
+                    outputs, targets, criterion)
 
             KLD = KLDLoss(mu, logvar)
             kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
@@ -288,6 +291,9 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
 
         return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words        
 
+    best_valid_acc = 0
+    best_valid_ppl = math.inf
+    best_epoch = 0
     for epoch in range(opt.start_epoch, opt.epochs + 1):
         print('')
 
@@ -318,21 +324,23 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
 
         #  (4) update the learning rate
         optim.updateLearningRate(valid_loss, epoch)
-
-        model_state_dict = model.module.state_dict() if len(opt.gpus) > 1 else model.state_dict()
-        model_state_dict = {k: v for k, v in model_state_dict.items() if 'generator' not in k}
-        generator_state_dict = model.generator.module.state_dict() if len(opt.gpus) > 1 else model.generator.state_dict()
-        #  (5) drop a checkpoint
-        checkpoint = {
-            'model': model_state_dict,
-            'generator': generator_state_dict,
-            'dicts': dataset['dicts'],
-            'opt': opt,
-            'epoch': epoch,
-            'optim': optim,
-            'stats': stats
-        }
-        torch.save(checkpoint,
+        if best_valid_acc < valid_acc: # only store checkpoints if accuracy improved
+            if epoch > opt.start_epoch:
+                os.remove('%s_acc_%.2f_ppl_%.2f_e%d.pt' % (opt.save_model, 100*best_valid_acc, best_valid_ppl, best_epoch))
+            best_valid_acc = valid_acc
+            best_valid_ppl = valid_ppl
+            best_epoch = epoch
+            model_state_dict = model.module.state_dict() if len(opt.gpus) > 1 else model.state_dict()
+            #  (5) drop a checkpoint
+            checkpoint = {
+                'model': model_state_dict,
+                'dicts': dataset['dicts'],
+                'opt': opt,
+                'epoch': epoch,
+                'optim': optim,
+                'stats': stats
+            }
+            torch.save(checkpoint,
                    '%s_acc_%.2f_ppl_%.2f_e%d.pt' % (opt.save_model, 100*valid_acc, valid_ppl, epoch))
 
 def main():
@@ -340,6 +348,9 @@ def main():
     print("Loading data from '%s'" % opt.data)
 
     dataset = torch.load(opt.data)
+    model_dir = os.path.dirname(opt.save_model)
+    if not os.path.isdir(model_dir):
+        os.mkdir(model_dir)
 
     dict_checkpoint = opt.train_from if opt.train_from else opt.train_from_state_dict
     if dict_checkpoint:
@@ -362,43 +373,36 @@ def main():
     print(' * maximum batch size. %d' % opt.batch_size)
 
     print('Building model...')
-
-    encoder = onmt.Models.Encoder(opt, dicts['src'])
-    decoder = onmt.Models.Decoder(opt, dicts['tgt'])
-
+    assert dicts['src'].size() == dicts['tgt'].size()
+    dict_size = dicts['src'].size()
+    word_lut = nn.Embedding(dicts['src'].size(),
+                            opt.word_vec_size,
+                            padding_idx=onmt.Constants.PAD)
     generator = nn.Sequential(
         nn.Linear(opt.rnn_size, dicts['tgt'].size()),
         nn.LogSoftmax())
+    encoder = onmt.Models.Encoder(opt, word_lut)
+    decoder = onmt.Models.Decoder(opt, word_lut, generator)
 
     model = onmt.Models.NMTModel(encoder, decoder, opt)
 
-    if opt.train_from:
+    if opt.train_from or opt.train_from_state_dict:
         print('Loading model from checkpoint at %s' % opt.train_from)
-        chk_model = checkpoint['model']
-        generator_state_dict = chk_model.generator.state_dict()
-        model_state_dict = {k: v for k, v in chk_model.state_dict().items() if 'generator' not in k}
-        model.load_state_dict(model_state_dict)
-        generator.load_state_dict(generator_state_dict)
+        model.load_state_dict(checkpoint['model'])
         opt.start_epoch = checkpoint['epoch'] + 1
 
     if opt.train_from_state_dict:
         print('Loading model from checkpoint at %s' % opt.train_from_state_dict)
         model.load_state_dict(checkpoint['model'])
-        generator.load_state_dict(checkpoint['generator'])
         opt.start_epoch = checkpoint['epoch'] + 1
 
     if len(opt.gpus) >= 1:
         model.cuda()
-        generator.cuda()
     else:
         model.cpu()
-        generator.cpu()
 
     if len(opt.gpus) > 1:
         model = nn.DataParallel(model, device_ids=opt.gpus, dim=1)
-        generator = nn.DataParallel(generator, device_ids=opt.gpus, dim=0)
-
-    model.generator = generator
 
     if not opt.train_from_state_dict and not opt.train_from:
         for p in model.parameters():
