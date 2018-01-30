@@ -131,28 +131,18 @@ if opt.gpus:
     cuda.set_device(opt.gpus[0])
 
 def plot_stats(stats):
-    metrics = ['loss', 'KLD', 'KLD_obj', 'num_correct']
+
+    metrics = ['train_loss', 'train_KLD', 'train_KLD_obj', 'train_accuracy', 'valid_loss', 'valid_KLD', 'valid_accuracy']
     model_dir = os.path.dirname(opt.save_model)
+
     for metric in metrics:
-        plt.plot([value / num_words for value, num_words in zip(stats[metric], stats['num_words'])])
+        plt.plot(stats['step'], stats[metric])
         plt.xlabel("step")
-        if metric is "num_correct":
-            plt.title("step accuracy")
-            plt.ylabel("percentage")
-        else:
-            plt.title("step " + metric.replace("_", " "))
-            plt.ylabel("nats/word")
-        plt.savefig(os.path.join(model_dir, metric + ".jpg"))
-        plt.close('all')
-    valid_metrics = ['valid_loss', 'valid_KLD', 'valid_accuracy']
-    for metric in valid_metrics:
-        plt.plot(stats['valid_step'], stats[metric])
-        plt.xlabel("step")
-        if metric is "valid_accuracy":
+        if "accuracy" in metric:
             plt.ylabel("percentage")
         else:
             plt.ylabel("nats/word")
-        plt.title("step " + metric.replace("_", " "))
+        plt.title(metric.replace("_", " "))
         plt.savefig(os.path.join(model_dir, metric + ".jpg"))
         plt.close('all')
     plt.plot(stats['kl_rate'])
@@ -199,6 +189,7 @@ def eval(model, criterion, data):
     total_num_correct = 0
 
     model.eval()
+
     for i in range(len(data)):
         batch = data[i][:-1] # exclude original indices
         outputs, mu, logvar = model(batch)
@@ -206,17 +197,15 @@ def eval(model, criterion, data):
         loss, _, num_correct = memoryEfficientLoss(
                 outputs, targets, criterion, eval=True)
         KLD = KLDLoss(mu, logvar)
-        total_loss += loss
+        total_loss += loss.data[0]
         total_KLD += KLD.data[0]
         total_num_correct += num_correct
         total_words += targets.data.ne(onmt.Constants.PAD).sum()
 
-    model.train()
     return total_loss / total_words, total_KLD / total_words, total_num_correct / total_words
 
 def trainModel(model, trainData, validData, dataset, optim, stats):
     print(model)
-    model.train()
 
     # define criterion of each GPU
     criterion = NMTCriterion(dataset['dicts']['tgt'].size())
@@ -224,6 +213,8 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
     start_time = time.time()
 
     def trainEpoch(epoch):
+
+        model.train()
 
         if opt.extra_shuffle and epoch > opt.curriculum:
             trainData.shuffle()
@@ -268,12 +259,7 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
             total_KLD_obj += KLD_obj.data[0]
             total_num_correct += num_correct
             total_words += num_words
-            stats['loss'].append(loss.data[0])
-            stats['KLD'].append(KLD.data[0])
-            stats['KLD_obj'].append(KLD_obj.data[0])
             stats['kl_rate'].append(kl_rate)
-            stats['num_words'].append(num_words)
-            stats['num_correct'].append(num_correct)
             if i % opt.log_interval == -1 % opt.log_interval:
                 print("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; KLD: %6.2f; KLD obj: %6.2f; kl rate: %2.6f; %3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed" %
                       (epoch, i+1, len(trainData),
@@ -299,8 +285,13 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
 
         #  (1) train for one epoch on the training set
         train_loss, train_KLD, train_KLD_obj, train_acc = trainEpoch(epoch)
-
         train_ppl = math.exp(min(train_loss, 100))
+
+        stats['train_loss'].append(train_loss)
+        stats['train_KLD'].append(train_KLD)
+        stats['train_KLD_obj'].append(train_KLD_obj)
+        stats['train_accuracy'].append(train_acc)
+
         print('Train perplexity: %g' % train_ppl)
         print('Train KL Divergence: %g' % train_KLD)
         print('Train KL divergence objective: %g' % train_KLD_obj)
@@ -308,13 +299,13 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
 
         #  (2) evaluate on the validation set
         valid_loss, valid_KLD, valid_acc = eval(model, criterion, validData)
-        valid_loss = valid_loss.data[0]
+        valid_ppl = math.exp(min(valid_loss, 100))
+
         stats['valid_loss'].append(valid_loss)
         stats['valid_KLD'].append(valid_KLD)
         stats['valid_accuracy'].append(valid_acc)
-        stats['valid_step'].append(epoch * len(trainData))
+        stats['step'].append(epoch * len(trainData))
 
-        valid_ppl = math.exp(min(valid_loss, 100))
         print('Validation perplexity: %g' % valid_ppl)
         print('Validation KL Divergence: %g' % valid_KLD)
         print('Validation accuracy: %g' % (valid_acc*100))
@@ -426,7 +417,7 @@ def main():
         optim.optimizer.load_state_dict(checkpoint['optim'].optimizer.state_dict())
         stats = checkpoints['stats']
     else:
-        stats = {'loss': [], 'KLD': [], 'KLD_obj': [], 'kl_rate': [], 'num_words': [], 'num_correct': [], 'valid_loss': [], 'valid_KLD': [], 'valid_accuracy': [], 'valid_step': []}
+        stats = {'train_loss': [], 'train_KLD': [], 'train_KLD_obj': [], 'train_accuracy': [], 'kl_rate': [], 'valid_loss': [], 'valid_KLD': [], 'valid_accuracy': [], 'step': []}
 
     nParams = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % nParams)
