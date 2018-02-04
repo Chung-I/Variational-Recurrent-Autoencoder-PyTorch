@@ -10,6 +10,8 @@ import math
 import time
 import os
 import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import numpy as np
 
 parser = argparse.ArgumentParser(description='train.py')
 
@@ -53,6 +55,8 @@ parser.add_argument('-brnn_merge', default='concat',
                     [concat|sum]""")
 parser.add_argument('-feed_gt_prob', type=float, default=0.75,
                     help="""Probability of feeding ground truth when training. See word dropout in \"Generating Sentences from a continuous space\".""")
+parser.add_argument('-prelu', action='store_true',
+                    help='Use prelu between encoder and decoder')
 
 ## Optimization options
 
@@ -74,7 +78,7 @@ parser.add_argument('-optim', default='adam',
 parser.add_argument('-max_grad_norm', type=float, default=5,
                     help="""If the norm of the gradient vector exceeds this,
                     renormalize it to have the norm equal to max_grad_norm""")
-parser.add_argument('-dropout', type=float, default=0.3,
+parser.add_argument('-dropout', type=float, default=0.0,
                     help='Dropout probability; applied between LSTM stacks.')
 parser.add_argument('-curriculum', action="store_true",
                     help="""For this many epochs, order the minibatches based
@@ -87,6 +91,10 @@ parser.add_argument('-k', type=int, default=50000,
                     help='sigmoid increase rate for kl rate. r = 1 / (1 + k * exp(-i/k))')
 parser.add_argument('-ss', type=int, default=50000,
                     help='sigmoid increase rate for scheduled sampling.')
+parser.add_argument('-deterministic', action='store_true',
+                    help='if true, no reparameterization')
+parser.add_argument('-kl_min', type=float, default=0.0,
+                    help='Minmum kl divergence for each latent dimension')
 
 #learning rate
 parser.add_argument('-learning_rate', type=float, default=1e-4,
@@ -117,8 +125,11 @@ parser.add_argument('-pre_word_vecs_dec',
 parser.add_argument('-gpus', default=[], nargs='+', type=int,
                     help="Use CUDA on the listed devices.")
 
+#log
 parser.add_argument('-log_interval', type=int, default=50,
                     help="Print stats at this interval.")
+parser.add_argument('-tsne_num_batches', type=int, default=5,
+                    help="How many batches to be added into tsne visualization")
 
 opt = parser.parse_args()
 
@@ -161,8 +172,12 @@ def NMTCriterion(vocabSize):
     return crit
 
 def KLDLoss(mu, logvar):
-    KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-    return torch.sum(KLD_element).mul_(-0.5)
+    KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar).mul_(-0.5)
+    kl_min_vec = Variable(KLD_element.data.new(KLD_element.size()).fill_(opt.kl_min))
+    KLD = torch.sum(KLD_element)
+    KLD_obj_element = torch.max(KLD_element, kl_min_vec)
+    KLD_obj = torch.sum(KLD_obj_element)
+    return KLD, KLD_obj
 
 def memoryEfficientLoss(outputs, targets, crit, eval=False):
     # compute generations one piece at a time
@@ -182,7 +197,16 @@ def memoryEfficientLoss(outputs, targets, crit, eval=False):
     grad_output = None if outputs.grad is None else outputs.grad.data
     return loss, grad_output, num_correct
 
-def eval(model, criterion, data):
+def plot_tsne(epoch, mus):
+    mus_embedded = TSNE().fit_transform(mus.data.cpu().numpy())
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.scatter(mus_embedded[:, 0], mus_embedded[:, 1])
+
+    model_dir = os.path.dirname(opt.save_model)
+    fig_name = "tsne_mu_epoch_{}.jpg".format(epoch)
+    plt.savefig(os.path.join(model_dir, fig_name))
+
+def eval(epoch, model, criterion, data):
     total_loss = 0
     total_KLD = 0
     total_words = 0
@@ -190,17 +214,23 @@ def eval(model, criterion, data):
 
     model.eval()
 
+    mus = []
     for i in range(len(data)):
         batch = data[i][:-1] # exclude original indices
         outputs, mu, logvar = model(batch)
+        if i < opt.tsne_num_batches:
+            mus.append(mu)
         targets = batch[1][1:]  # exclude <s> from targets
         loss, _, num_correct = memoryEfficientLoss(
                 outputs, targets, criterion, eval=True)
-        KLD = KLDLoss(mu, logvar)
+        KLD, KLD_obj = KLDLoss(mu, logvar)
         total_loss += loss.data[0]
         total_KLD += KLD.data[0]
         total_num_correct += num_correct
         total_words += targets.data.ne(onmt.Constants.PAD).sum()
+
+    mus = torch.cat(mus, 0)
+    plot_tsne(epoch, mus)
 
     return total_loss / total_words, total_KLD / total_words, total_num_correct / total_words
 
@@ -237,9 +267,12 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
             loss, gradOutput, num_correct = memoryEfficientLoss(
                     outputs, targets, criterion)
 
-            KLD = KLDLoss(mu, logvar)
-            kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
-            KLD_obj = kl_rate * KLD
+            KLD, KLD_obj = KLDLoss(mu, logvar)
+            if opt.k != 0:
+                kl_rate = 1 / (1 + opt.k * math.exp(-total_step/opt.k))
+            else:
+                kl_rate = 1
+            KLD_obj = kl_rate * KLD_obj
 
             elbo = KLD_obj + loss
             elbo.backward()
@@ -271,15 +304,23 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
                       report_src_words/(time.time()-start),
                       report_tgt_words/(time.time()-start),
                       time.time()-start_time))
+                mu_mean = mu.mean()
+                mu_std  = mu.std()
+                logvar_mean = logvar.mean()
+                logvar_std = logvar.std()
+                print("mu mean: {:0.5f}".format(mu_mean.data[0]))
+                print("mu std: {:0.5f}".format(mu_std.data[0]))
+                print("logvar mean: {:0.5f}".format(logvar_mean.data[0]))
+                print("logvar std: {:0.5f}".format(logvar_std.data[0]))
                 report_loss = report_KLD = report_KLD_obj = report_tgt_words = report_src_words = report_num_correct = 0
 
                 start = time.time()
 
         return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words        
 
-    best_valid_acc = 0
-    best_valid_ppl = math.inf
-    best_epoch = 0
+    best_valid_acc = max(stats['valid_accuracy']) if stats['valid_accuracy'] else 0
+    best_valid_ppl = math.exp(min(stats['valid_loss'])) if stats['valid_loss'] else math.inf
+    best_epoch = 1 + np.argmax(stats['valid_accuracy']) if stats['valid_accuracy'] else 1
     for epoch in range(opt.start_epoch, opt.epochs + 1):
         print('')
 
@@ -298,7 +339,7 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
         print('Train accuracy: %g' % (train_acc*100))
 
         #  (2) evaluate on the validation set
-        valid_loss, valid_KLD, valid_acc = eval(model, criterion, validData)
+        valid_loss, valid_KLD, valid_acc = eval(epoch, model, criterion, validData)
         valid_ppl = math.exp(min(valid_loss, 100))
 
         stats['valid_loss'].append(valid_loss)
@@ -336,19 +377,21 @@ def trainModel(model, trainData, validData, dataset, optim, stats):
 
 def main():
 
+    global opt
+    ckpt_path = opt.train_from if opt.train_from else opt.train_from_state_dict
+    if ckpt_path:
+        print('Loading dicts from checkpoint at %s' % ckpt_path)
+        checkpoint = torch.load(ckpt_path)
+        opt = checkpoint['opt']
+
     print("Loading data from '%s'" % opt.data)
 
     dataset = torch.load(opt.data)
+    if ckpt_path:
+        dataset['dicts'] = checkpoint['dicts']
     model_dir = os.path.dirname(opt.save_model)
     if not os.path.isdir(model_dir):
         os.mkdir(model_dir)
-
-    dict_checkpoint = opt.train_from if opt.train_from else opt.train_from_state_dict
-    if dict_checkpoint:
-        print('Loading dicts from checkpoint at %s' % dict_checkpoint)
-        checkpoint = torch.load(dict_checkpoint)
-        dataset['dicts'] = checkpoint['dicts']
-
 
     trainData = onmt.Dataset(dataset['train']['src'],
                              dataset['train']['tgt'], opt.batch_size, opt.gpus)
@@ -377,13 +420,8 @@ def main():
 
     model = onmt.Models.NMTModel(encoder, decoder, opt)
 
-    if opt.train_from or opt.train_from_state_dict:
-        print('Loading model from checkpoint at %s' % opt.train_from)
-        model.load_state_dict(checkpoint['model'])
-        opt.start_epoch = checkpoint['epoch'] + 1
-
-    if opt.train_from_state_dict:
-        print('Loading model from checkpoint at %s' % opt.train_from_state_dict)
+    if ckpt_path:
+        print('Loading model from checkpoint at %s' % ckpt_path)
         model.load_state_dict(checkpoint['model'])
         opt.start_epoch = checkpoint['epoch'] + 1
 
@@ -395,7 +433,7 @@ def main():
     if len(opt.gpus) > 1:
         model = nn.DataParallel(model, device_ids=opt.gpus, dim=1)
 
-    if not opt.train_from_state_dict and not opt.train_from:
+    if not ckpt_path:
         for p in model.parameters():
             p.data.uniform_(-opt.param_init, opt.param_init)
 
@@ -411,11 +449,12 @@ def main():
     else:
         print('Loading optimizer from checkpoint:')
         optim = checkpoint['optim']
-        print(optim)
-
-    if opt.train_from or opt.train_from_state_dict:
+        optim.set_parameters(model.parameters())
         optim.optimizer.load_state_dict(checkpoint['optim'].optimizer.state_dict())
-        stats = checkpoints['stats']
+
+
+    if ckpt_path:
+        stats = checkpoint['stats']
     else:
         stats = {'train_loss': [], 'train_KLD': [], 'train_KLD_obj': [], 'train_accuracy': [], 'kl_rate': [], 'valid_loss': [], 'valid_KLD': [], 'valid_accuracy': [], 'step': []}
 

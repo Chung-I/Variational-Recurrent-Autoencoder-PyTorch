@@ -122,13 +122,17 @@ class NMTModel(nn.Module):
         self.latent_size = opt.latent_size
         self.feed_gt_prob = opt.feed_gt_prob
         self.dynamic_decode = opt.dynamic_decode
+        self.deterministic = opt.deterministic
+        self.prelu = opt.prelu
         concat_hidden_size = opt.layers * opt.rnn_size * 2  # multiply by 2 because it's LSTM
         self.encoder_to_mu = nn.Linear(concat_hidden_size, opt.latent_size)
-        self.encoder_to_logvar = nn.Linear(concat_hidden_size, opt.latent_size)
+        self.encoder_to_nu = nn.Linear(concat_hidden_size, opt.latent_size)
+        self.nu_to_logvar = nn.Linear(opt.latent_size, opt.latent_size)
         self.latent_to_decoder = nn.Linear(opt.latent_size, concat_hidden_size)
-        self.prelu_mu = nn.PReLU()
-        self.prelu_logvar = nn.PReLU()
-        self.prelu_dec = nn.PReLU()
+        if self.prelu:
+            self.prelu_mu = nn.PReLU()
+            self.prelu_logvar = nn.PReLU()
+            self.prelu_dec = nn.PReLU()
 
     def encode(self, x):
         enc_hidden, _ = self.encoder(x)
@@ -136,8 +140,12 @@ class NMTModel(nn.Module):
         #  we need to convert it to batch x (2*layers*directions*dim)
         enc_hidden = torch.cat((enc_hidden[0], enc_hidden[1]), 2).transpose(0,1).contiguous() 
         enc_hidden = enc_hidden.view(enc_hidden.size(0), -1)
-        mu = self.prelu_mu(self.encoder_to_mu(enc_hidden))
-        logvar = self.prelu_logvar(self.encoder_to_logvar(enc_hidden))
+        mu = self.encoder_to_mu(enc_hidden)
+        nu = nn.ReLU()(self.encoder_to_nu(enc_hidden))
+        logvar = -2 * torch.abs(self.nu_to_logvar(nu))
+        if self.prelu:
+            mu = self.prelu_mu(mu)
+            logvar = self.prelu_logvar(logvar)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -155,7 +163,9 @@ class NMTModel(nn.Module):
         return Variable(z.data.new(*h_size).zero_(), requires_grad=False)
 
     def decode(self, z, tgt, step):
-        decStates = self.prelu_dec(self.latent_to_decoder(z))
+        decStates = self.latent_to_decoder(z)
+        if self.prelu:
+            decStates = self.prelu_dec(decStates)
         # the decoder state is batch x (2*layers*directions*dim)
         # we need to convert it to a tensor tuple with dimesion layers x batch x (directions * dim)
         decStates = decStates.view(self.layers, z.size(0), -1)
@@ -195,7 +205,10 @@ class NMTModel(nn.Module):
         if self.training and self.feed_gt_prob < 1:
             tgt = self.replace_by_unk(tgt, self.feed_gt_prob)
         mu, logvar = self.encode(src)
-        z = self.reparameterize(mu, logvar)
-        out = self.decode(mu, tgt, step)
+        if not self.deterministic:
+           z = self.reparameterize(mu, logvar)
+        else:
+           z = mu
+        out = self.decode(z, tgt, step)
 
         return out, mu, logvar

@@ -74,7 +74,9 @@ class Translator(object):
         beamSize = self.opt.beam_size
         rnnSize = self.model.decoder.hidden_size
         beam = [onmt.Beam(beamSize, self.opt.cuda) for k in range(batchSize)]
-        decStates = self.model.prelu_dec(self.model.latent_to_decoder(encStates))
+        decStates = self.model.latent_to_decoder(encStates)
+        if self.model.prelu:
+            decStates = self.model.prelu_dec(decStates)
         decStates = decStates.view(self.model.layers, decStates.size(0), -1)
         decStates = torch.split(decStates, decStates.size(-1)//2, 2)
 
@@ -183,7 +185,9 @@ class Translator(object):
         # Expand tensors for each beam.
 
         beam = [onmt.Beam(beamSize, self.opt.cuda) for k in range(batchSize)]
-        decStates = self.model.prelu_dec(self.model.latent_to_decoder(encStates))
+        decStates = self.model.latent_to_decoder(encStates)
+        if self.model.prelu:
+            decStates = self.model.prelu_dec(decStates)
         decStates = decStates.view(self.model.layers, decStates.size(0), -1)
         decStates = torch.chunk(decStates, 2, 2)
         decStates = (Variable(decStates[0].data.repeat(1, beamSize, 1)),
@@ -285,7 +289,7 @@ class Translator(object):
         src, _, indices = dataset[0]
         mu, logvar = self.model.encode(src)
         start, end = mu[0].data, mu[1].data
-        points = Variable(torch.cat([slerp(start, end, w).view(1, -1) for w in torch.range(0, 1, 1/(num_pts - 1))], 0))
+        points = Variable(torch.cat([slerp(start, end, w).view(1, -1) for w in torch.arange(0, 1, 1/(num_pts - 1))], 0))
         pred, predScore = self.beam_decode(points)
         indices = [i for i in range(0, num_pts)] if indices[0] < indices[1] else [i for i in range(num_pts-1, -1, -1)]
         pred, predScore = list(zip(*sorted(zip(pred, predScore, indices), key=lambda x: x[-1])))[:-1]
