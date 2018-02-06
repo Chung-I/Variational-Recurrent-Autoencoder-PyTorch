@@ -1,4 +1,4 @@
-def train_opts(parser):
+dsdef train_opts(parser):
 
     # Model loading/saving options
 
@@ -19,7 +19,7 @@ def train_opts(parser):
     parser.add_argument('-train_from', default='', type=str,
                         help="""If training from a checkpoint then this is the
                         path to the pretrained model.""")
-    
+
     # Optimization options
     parser.add_argument('-batch_size', type=int, default=64,
                         help='Maximum batch size')
@@ -27,7 +27,7 @@ def train_opts(parser):
                         help="""Maximum batches of words in a sequence to run
                         the generator on in parallel. Higher is faster, but uses
                         more memory.""")
-    parser.add_argument('-epochs', type=int, default=20,
+    parser.add_argument('-epochs', type=int, default=150,
                         help='Number of training epochs')
     parser.add_argument('-optim', default='adam',
                         help="Optimization method. [sgd|adagrad|adadelta|adam]")
@@ -55,7 +55,7 @@ def train_opts(parser):
                         help="""Probability of feeding ground truth when training. See word dropout in \"Generating Sentences from a continuous space\".""")
     parser.add_argument('-dynamic_decode', action='store_true',
                         help='feed outputs of previous steps instead of ground truth')
-    
+
     #learning rate
     parser.add_argument('-learning_rate', type=float, default=1e-4,
                         help="""Starting learning rate. If adagrad/adadelta/adam is
@@ -69,7 +69,7 @@ def train_opts(parser):
     parser.add_argument('-start_decay_at', type=int, default=8,
                         help="""Start decaying every epoch after and including this
                         epoch""")
-    
+
     #pretrained word vectors
     parser.add_argument('-pre_word_vecs_enc',
                         help="""If a valid path is specified, then this will load
@@ -79,22 +79,26 @@ def train_opts(parser):
                         help="""If a valid path is specified, then this will load
                         pretrained word embeddings on the decoder side.
                         See README for specific formatting instructions.""")
-    
+
     # GPU
     parser.add_argument('-gpus', default=[], nargs='+', type=int,
                         help="Use CUDA on the listed devices.")
-    
+
     #log
     parser.add_argument('-log_interval', type=int, default=50,
                         help="Print stats at this interval.")
-    parser.add_argument('-tsne_num_batches', type=int, default=5,
+    parser.add_argument('-tsne_num_batches', type=int, default=20,
                         help="How many batches to be added into tsne visualization")
+    parser.add_argument('-validation_num_batches', type=int, default=200,
+                        help="How many batches to be evaluated using kenlm")
+    parser.add_argument('-lm_path', type=str, required=True,
+                        help="How many batches to be evaluated using kenlm")
 
 def model_opts(parser):
-    
+
     # Model options
 
-    parser.add_argument('-layers', type=int, default=2,
+    parser.add_argument('-layers', type=int, default=1,
                         help='Number of layers in the LSTM encoder/decoder')
     parser.add_argument('-rnn_size', type=int, default=500,
                         help='Size of LSTM hidden states')
@@ -113,4 +117,23 @@ def model_opts(parser):
                         [concat|sum]""")
     parser.add_argument('-prelu', action='store_true',
                         help='Use prelu between encoder and decoder')
-    
+
+def translator_opts(parser):
+    parser.add_argument('-beam_size',  type=int, default=5,
+                        help='Beam size')
+    parser.add_argument('-max_sent_length', type=int, default=100,
+                        help='Maximum sentence length.')
+    parser.add_argument('-replace_unk', action="store_true",
+                        help="""Replace the generated UNK tokens with the source
+                        token that had the highest attention weight. If phrase_table
+                        is provided, it will lookup the identified source token and
+                        give the corresponding target token. If it is not provided
+                        (or the identified source token does not exist in the
+                        table) then it will copy the source token""")
+    parser.add_argument('-n_best', type=int, default=1,
+                        help="""If verbose is set, will output the n_best
+                        decoded sentences""")
+
+def bo_opts(parser):
+    parser.add_argument('-bo_output_path',  type=str, required=True,
+                        help='bayesian optimization results path')

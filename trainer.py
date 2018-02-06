@@ -13,14 +13,14 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import numpy as np
 import opts
-
-
+import kenlm
 
 
 def plot_stats(save_model):
 
     def _plot_stats(stats):
-        metrics = ['train_loss', 'train_KLD', 'train_KLD_obj', 'train_accuracy', 'valid_loss', 'valid_KLD', 'valid_accuracy']
+        metrics = ['train_loss', 'train_KLD', 'train_KLD_obj', 'train_accuracy',
+        'valid_loss', 'valid_KLD', 'valid_accuracy', 'valid_lm_nll']
         model_dir = os.path.dirname(save_model)
 
         for metric in metrics:
@@ -64,7 +64,7 @@ def memoryEfficientLoss(max_generator_batches):
     def _memoryEfficientLoss(outputs, targets, crit, eval=False):
         # compute generations one piece at a time
         num_correct, loss = 0, 0
-    
+
         batch_size = outputs.size(1)
         outputs_split = torch.split(outputs, max_generator_batches)
         targets_split = torch.split(targets, max_generator_batches)
@@ -75,7 +75,7 @@ def memoryEfficientLoss(max_generator_batches):
             num_correct_t = pred_t.data.eq(targ_t.data).masked_select(targ_t.ne(onmt.Constants.PAD).data).sum()
             num_correct += num_correct_t
             loss += loss_t
-    
+
         grad_output = None if outputs.grad is None else outputs.grad.data
         return loss, grad_output, num_correct
 
@@ -127,11 +127,28 @@ def eval(model, criterion, plot_tsne, tsne_num_batches):
 
     return _eval
 
+def get_nll(lm, sentences):
+    """
+    Assume sentences is a list of strings (space delimited sentences)
+    """
+    total_nll = 0
+    total_wc = 0
+    for sent in sentences:
+        words = sent.strip().split()
+        score = lm.score(sent, bos=False, eos=False)
+        word_count = len(words)
+        total_wc += word_count
+        total_nll += score
+    nll = total_nll/total_wc
+    return nll
+
 def trainModel(model, trainData, validData, dataset, optim, stats, opt):
     print(model)
 
     # define criterion of each GPU
     criterion = NMTCriterion(dataset['dicts']['tgt'].size(), opt.gpus)
+    translator = onmt.Translator(opt)
+    lm = kenlm.Model(opt.lm_path)
 
     start_time = time.time()
 
@@ -210,10 +227,11 @@ def trainModel(model, trainData, validData, dataset, optim, stats, opt):
 
                 start = time.time()
 
-        return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words        
+        return total_loss / total_words, total_KLD / total_words, total_KLD_obj / total_words, total_num_correct / total_words
 
     best_valid_acc = max(stats['valid_accuracy']) if stats['valid_accuracy'] else 0
     best_valid_ppl = math.exp(min(stats['valid_loss'])) if stats['valid_loss'] else math.inf
+    best_valid_lm_nll = math.exp(min(stats['valid_lm_nll'])) if stats['valid_lm_nll'] else math.inf
     best_epoch = 1 + np.argmax(stats['valid_accuracy']) if stats['valid_accuracy'] else 1
     for epoch in range(opt.start_epoch, opt.epochs + 1):
         print('')
@@ -238,15 +256,25 @@ def trainModel(model, trainData, validData, dataset, optim, stats, opt):
         _eval = eval(model, criterion, plot_tsne, opt.tsne_num_batches)
         valid_loss, valid_KLD, valid_acc = _eval(validData)
         valid_ppl = math.exp(min(valid_loss, 100))
+        sampled_sentences = []
+        for i in range(opt.validation_num_batches):
+            predBatch, predScore = translator.sample(opt.batch_size)
+            for pred in predBatch:
+            sampled_sentences.append(" ".join(pred[0]))
+        valid_lm_nll = get_nll(lm, sampled_sentences)
+
+
 
         stats['valid_loss'].append(valid_loss)
         stats['valid_KLD'].append(valid_KLD)
         stats['valid_accuracy'].append(valid_acc)
+        stats['valid_lm_nll'].append(valid_lm_nll)
         stats['step'].append(epoch * len(trainData))
 
         print('Validation perplexity: %g' % valid_ppl)
         print('Validation KL Divergence: %g' % valid_KLD)
         print('Validation accuracy: %g' % (valid_acc*100))
+        print('Validation kenlm nll: %g' % (valid_lm_nll))
 
         #  (3) plot statistics
         _plot_stats = plot_stats(opt.save_model)
@@ -254,10 +282,12 @@ def trainModel(model, trainData, validData, dataset, optim, stats, opt):
 
         #  (4) update the learning rate
         optim.updateLearningRate(valid_loss, epoch)
-        if best_valid_acc < valid_acc: # only store checkpoints if accuracy improved
+        if best_valid_lm_nll > valid_lm_nll: # only store checkpoints if accuracy improved
             if epoch > opt.start_epoch:
-                os.remove('%s_acc_%.2f_ppl_%.2f_e%d.pt' % (opt.save_model, 100*best_valid_acc, best_valid_ppl, best_epoch))
+                os.remove('%s_acc_%.2f_ppl_%.2f_lmnll_%.2f_e%d.pt'\
+                % (opt.save_model, 100*best_valid_acc, best_valid_ppl, best_valid_lm_nll, best_epoch))
             best_valid_acc = valid_acc
+            best_valid_lm_nll = valid_lm_nll
             best_valid_ppl = valid_ppl
             best_epoch = epoch
             model_state_dict = model.module.state_dict() if len(opt.gpus) > 1 else model.state_dict()
@@ -271,16 +301,21 @@ def trainModel(model, trainData, validData, dataset, optim, stats, opt):
                 'stats': stats
             }
             torch.save(checkpoint,
-                   '%s_acc_%.2f_ppl_%.2f_e%d.pt' % (opt.save_model, 100*valid_acc, valid_ppl, epoch))
+                   '%s_acc_%.2f_ppl_%.2f_lmnll_%.2f_e%d.pt' % (opt.save_model, 100*valid_acc, valid_ppl, valid_lm_nll, epoch))
+
+    return best_valid_lm_nll
 
 
-def train(opt):
+def train(opt, dataset):
 
     if torch.cuda.is_available() and not opt.gpus:
         print("WARNING: You have a CUDA device, so you should probably run with -gpus 0")
-    
+
     if opt.gpus:
         cuda.set_device(opt.gpus[0])
+        opt.cuda = True
+    else:
+        opt.cuda = False
 
     ckpt_path = opt.train_from
     if ckpt_path:
@@ -290,7 +325,6 @@ def train(opt):
 
     print("Loading data from '%s'" % opt.data)
 
-    dataset = torch.load(opt.data)
     if ckpt_path:
         dataset['dicts'] = checkpoint['dicts']
     model_dir = os.path.dirname(opt.save_model)
@@ -323,6 +357,7 @@ def train(opt):
     decoder = onmt.Models.Decoder(opt, word_lut, generator)
 
     model = onmt.Models.NMTModel(encoder, decoder, opt)
+
 
     if ckpt_path:
         print('Loading model from checkpoint at %s' % ckpt_path)
@@ -360,17 +395,20 @@ def train(opt):
     if ckpt_path:
         stats = checkpoint['stats']
     else:
-        stats = {'train_loss': [], 'train_KLD': [], 'train_KLD_obj': [], 'train_accuracy': [], 'kl_rate': [], 'valid_loss': [], 'valid_KLD': [], 'valid_accuracy': [], 'step': []}
+        stats = {'train_loss': [], 'train_KLD': [], 'train_KLD_obj': [],
+        'train_accuracy': [], 'kl_rate': [], 'valid_loss': [], 'valid_KLD': [],
+        'valid_accuracy': [], 'valid_lm_nll', 'step': []}
 
     nParams = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % nParams)
 
-    trainModel(model, trainData, validData, dataset, optim, stats, opt)
+    best_valid_lm_nll = trainModel(model, trainData, validData, dataset, optim, stats, opt)
+    return best_valid_lm_nll
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='train.py')
-    
+
     opts.model_opts(parser)
     opts.train_opts(parser)
     opt = parser.parse_args()
