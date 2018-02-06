@@ -309,7 +309,7 @@ class Translator(object):
         predBatch = []
         for b in range(points.size(0)):
             predBatch.append(
-                [self.tgt_dict.convertToLabels(pred[b][n], onmt.Constants.EOS)[:-1]
+                [self.tgt_dict.convertToLabels(pred[b][n], onmt.Constants.EOS)
                     for n in range(self.opt.n_best)]
             )
         return predBatch, predScore
